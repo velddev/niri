@@ -94,7 +94,7 @@ use crate::protocols::virtual_pointer::{
 };
 use crate::utils::{output_size, send_scale_transform};
 use crate::{
-    delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
+    delegate_appmenu, delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
     delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
     delegate_toplevel_export, delegate_virtual_pointer,
 };
@@ -709,6 +709,8 @@ impl ToplevelExportHandler for State {
     }
 }
 delegate_toplevel_export!(State);
+
+delegate_appmenu!(State);
 
 impl State {
     /// Render the window copies that were waiting for this toplevel to commit.

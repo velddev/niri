@@ -1343,6 +1343,22 @@ pub struct Window {
     ///
     /// The timestamp comes from the monotonic clock.
     pub focus_timestamp: Option<Timestamp>,
+    /// Where this window's menu bar lives, if the app published one.
+    ///
+    /// Apps publish it with the KDE appmenu protocol (`org_kde_kwin_appmenu`), so a shell can
+    /// show the menu outside the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_menu: Option<AppMenu>,
+}
+
+/// D-Bus address of a window's menu bar: a `com.canonical.dbusmenu` object on the session bus.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AppMenu {
+    /// D-Bus service name of the app's menu.
+    pub service_name: String,
+    /// D-Bus object path of the menu.
+    pub object_path: String,
 }
 
 /// A moment in time.

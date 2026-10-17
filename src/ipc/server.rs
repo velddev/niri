@@ -34,6 +34,7 @@ use crate::backend::IpcOutputMap;
 use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
+use crate::protocols::appmenu;
 use crate::utils::{version, with_toplevel_role};
 use crate::window::Mapped;
 
@@ -549,6 +550,8 @@ fn make_ipc_window(
     workspace_id: Option<WorkspaceId>,
     layout: WindowLayout,
 ) -> niri_ipc::Window {
+    // Read before with_toplevel_role(): both lock the surface's data, which isn't re-entrant.
+    let app_menu = appmenu::app_menu(mapped.toplevel().wl_surface());
     with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
         id: mapped.id().get(),
         title: role.title.clone(),
@@ -560,6 +563,7 @@ fn make_ipc_window(
         is_urgent: mapped.is_urgent(),
         layout,
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
+        app_menu,
     })
 }
 
@@ -756,6 +760,7 @@ impl State {
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id
             });
+            changed |= ipc_win.app_menu != appmenu::app_menu(mapped.toplevel().wl_surface());
 
             if changed {
                 let window = make_ipc_window(mapped, ws_id, window_layout);

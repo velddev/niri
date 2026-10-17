@@ -731,6 +731,10 @@ fn print_window(window: &Window) {
         println!("  PID: (unknown)");
     }
 
+    if let Some(menu) = &window.app_menu {
+        println!("  App menu: {} {}", menu.service_name, menu.object_path);
+    }
+
     if let Some(workspace_id) = window.workspace_id {
         println!("  Workspace ID: {workspace_id}");
     } else {

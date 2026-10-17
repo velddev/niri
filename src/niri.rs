@@ -144,6 +144,7 @@ use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
 use crate::niri_render_elements;
+use crate::protocols::appmenu::AppmenuManagerState;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
@@ -282,6 +283,7 @@ pub struct Niri {
     pub ext_workspace_state: ExtWorkspaceManagerState,
     pub screencopy_state: ScreencopyManagerState,
     pub toplevel_export_state: ToplevelExportManagerState,
+    pub appmenu_state: AppmenuManagerState,
     pub output_management_state: OutputManagementManagerState,
     pub viewporter_state: ViewporterState,
     pub background_effect_state: BackgroundEffectState,
@@ -2345,6 +2347,7 @@ impl Niri {
             ScreencopyManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
         let toplevel_export_state =
             ToplevelExportManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
+        let appmenu_state = AppmenuManagerState::new::<State>(&display_handle);
         let viewporter_state = ViewporterState::new::<State>(&display_handle);
         let background_effect_state = BackgroundEffectState::new::<State>(&display_handle);
         let xdg_foreign_state = XdgForeignState::new::<State>(&display_handle);
@@ -2530,6 +2533,7 @@ impl Niri {
             output_management_state,
             screencopy_state,
             toplevel_export_state,
+            appmenu_state,
             viewporter_state,
             background_effect_state,
             xdg_foreign_state,
