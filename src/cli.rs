@@ -109,6 +109,8 @@ pub enum Msg {
     OverviewState,
     /// List screencasts.
     Casts,
+    /// Print where windows are currently drawn on their outputs, including in the overview.
+    WindowRects,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]

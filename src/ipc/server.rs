@@ -455,6 +455,38 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
         }
+        Request::WindowRects => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let mut rects = Vec::new();
+                for mon in state.niri.layout.monitors() {
+                    // Same mapping as Monitor::window_under(), in reverse. The zoom is 1 outside
+                    // the overview.
+                    let zoom = mon.overview_zoom();
+                    for (ws, geo) in mon.workspaces_with_render_geo() {
+                        for (tile, pos, visible) in ws.tiles_with_render_positions() {
+                            if !visible {
+                                continue;
+                            }
+                            let loc = geo.loc + pos.upscale(zoom);
+                            let size = tile.tile_size().upscale(zoom);
+                            rects.push(niri_ipc::WindowRect {
+                                window_id: tile.window().id().get(),
+                                workspace_id: ws.id().get(),
+                                output: mon.output_name().clone(),
+                                pos: (loc.x, loc.y),
+                                size: (size.w, size.h),
+                                scale: zoom,
+                            });
+                        }
+                    }
+                }
+                let _ = tx.send_blocking(rects);
+            });
+            let result = rx.recv().await;
+            let rects = result.map_err(|_| String::from("error getting window rects"))?;
+            Response::WindowRects(rects)
+        }
     };
 
     Ok(response)

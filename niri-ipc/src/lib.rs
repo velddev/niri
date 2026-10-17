@@ -119,6 +119,13 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Request where windows are currently drawn on their outputs.
+    ///
+    /// Unlike [`WindowLayout::tile_pos_in_workspace_view`], this covers tiled windows too, and
+    /// follows the overview: positions include the overview zoom, the workspaces stacked above
+    /// and below, and each workspace's horizontal scroll, as drawn at the moment of the request
+    /// (including mid-animation).
+    WindowRects,
 }
 
 /// Reply from niri to client.
@@ -165,6 +172,8 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Where windows are currently drawn.
+    WindowRects(Vec<WindowRect>),
 }
 
 /// Overview information.
@@ -1390,6 +1399,30 @@ pub struct WindowLayout {
     /// the distance from the corner of the black backdrop to the corner of the (centered) window
     /// contents.
     pub window_offset_in_tile: (f64, f64),
+}
+
+/// Where a window is currently drawn on its output.
+///
+/// Covers windows on every workspace that is at least partly on screen, so in the overview this
+/// includes the workspaces above and below the active one. Rectangles may extend past the output
+/// edges (columns scrolled out of view). A window being dragged by the mouse is not included.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowRect {
+    /// Id of the window.
+    pub window_id: u64,
+    /// Id of the workspace the window is on.
+    pub workspace_id: u64,
+    /// Name of the output the window is drawn on.
+    pub output: String,
+    /// Position of the tile's top-left corner relative to the output, in logical pixels.
+    pub pos: (f64, f64),
+    /// Size of the tile as drawn, in logical pixels.
+    ///
+    /// In the overview this is already scaled down by [`Self::scale`].
+    pub size: (f64, f64),
+    /// Scale the window's workspace is drawn at: 1 normally, the overview zoom in the overview.
+    pub scale: f64,
 }
 
 /// Output configuration change result.

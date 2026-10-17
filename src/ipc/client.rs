@@ -8,7 +8,7 @@ use niri_config::OutputName;
 use niri_ipc::socket::Socket;
 use niri_ipc::{
     Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
-    OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
+    OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout, WindowRect,
 };
 use serde_json::json;
 
@@ -49,6 +49,7 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
+        Msg::WindowRects => Request::WindowRects,
     };
 
     let mut socket = Socket::connect().context("error connecting to the niri socket")?;
@@ -548,6 +549,39 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             for cast in casts {
                 print_cast(&cast);
                 println!();
+            }
+        }
+        Msg::WindowRects => {
+            let Response::WindowRects(mut rects) = response else {
+                bail!("unexpected response: expected WindowRects, got {response:?}");
+            };
+
+            if json {
+                let rects = serde_json::to_string(&rects).context("error formatting response")?;
+                println!("{rects}");
+                return Ok(());
+            }
+
+            if rects.is_empty() {
+                println!("No windows on screen.");
+                return Ok(());
+            }
+
+            rects.sort_by(|a, b| a.output.cmp(&b.output).then(a.window_id.cmp(&b.window_id)));
+            for rect in rects {
+                let WindowRect {
+                    window_id,
+                    workspace_id,
+                    output,
+                    pos,
+                    size,
+                    scale,
+                } = rect;
+                println!(
+                    "Window ID {window_id} on output \"{output}\", workspace ID {workspace_id}: \
+                     {} x {} at {}, {} (scale {scale})",
+                    size.0, size.1, pos.0, pos.1
+                );
             }
         }
     }
