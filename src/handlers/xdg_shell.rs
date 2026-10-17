@@ -818,6 +818,10 @@ impl XdgShellHandler for State {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.niri
+            .toplevel_export_state
+            .remove_surface(surface.wl_surface());
+
         if self
             .niri
             .unmapped_windows

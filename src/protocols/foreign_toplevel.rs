@@ -90,6 +90,16 @@ impl ForeignToplevelManagerState {
     }
 }
 
+impl ForeignToplevelManagerState {
+    /// The toplevel surface a wlr foreign toplevel handle refers to.
+    pub fn surface_for_wlr_handle(&self, handle: &ZwlrForeignToplevelHandleV1) -> Option<WlSurface> {
+        self.toplevels
+            .iter()
+            .find(|(_, data)| data.wlr_management_instances.contains_key(handle))
+            .map(|(surface, _)| surface.clone())
+    }
+}
+
 pub fn refresh(state: &mut State) {
     let _span = tracy_client::span!("foreign_toplevel::refresh");
 

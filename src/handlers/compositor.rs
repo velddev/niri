@@ -76,6 +76,19 @@ impl CompositorHandler for State {
             return;
         }
 
+        // New window contents: render the window copies waiting for them, once this commit
+        // has been applied to the layout.
+        if self
+            .niri
+            .toplevel_export_state
+            .is_waiting_for(&root_surface)
+        {
+            let root = root_surface.clone();
+            self.niri
+                .event_loop
+                .insert_idle(move |state| state.render_waiting_toplevel_exports(&root));
+        }
+
         if surface == &root_surface {
             // This is a root surface commit. It might have mapped a previously-unmapped toplevel.
             if let Entry::Occupied(entry) = self.niri.unmapped_windows.entry(surface.clone()) {

@@ -150,6 +150,7 @@ use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
+use crate::protocols::toplevel_export::{ExportBuffer, ToplevelExport, ToplevelExportManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
@@ -280,6 +281,7 @@ pub struct Niri {
     pub foreign_toplevel_state: ForeignToplevelManagerState,
     pub ext_workspace_state: ExtWorkspaceManagerState,
     pub screencopy_state: ScreencopyManagerState,
+    pub toplevel_export_state: ToplevelExportManagerState,
     pub output_management_state: OutputManagementManagerState,
     pub viewporter_state: ViewporterState,
     pub background_effect_state: BackgroundEffectState,
@@ -2341,6 +2343,8 @@ impl Niri {
         output_management_state.on_config_changed(config_.outputs.clone());
         let screencopy_state =
             ScreencopyManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
+        let toplevel_export_state =
+            ToplevelExportManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
         let viewporter_state = ViewporterState::new::<State>(&display_handle);
         let background_effect_state = BackgroundEffectState::new::<State>(&display_handle);
         let xdg_foreign_state = XdgForeignState::new::<State>(&display_handle);
@@ -2525,6 +2529,7 @@ impl Niri {
             ext_workspace_state,
             output_management_state,
             screencopy_state,
+            toplevel_export_state,
             viewporter_state,
             background_effect_state,
             xdg_foreign_state,
@@ -5434,6 +5439,68 @@ impl Niri {
         };
 
         Ok(sync)
+    }
+
+    /// Render one window into a hyprland-toplevel-export buffer and submit it.
+    pub fn render_toplevel_export(
+        &self,
+        renderer: &mut GlesRenderer,
+        export: ToplevelExport,
+    ) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("Niri::render_toplevel_export");
+
+        let Some((mapped, output)) = self.layout.find_window_and_output(export.surface()) else {
+            bail!("window to export is gone");
+        };
+        let scale = Scale::from(output.map_or(1., |o| o.current_scale().fractional_scale()));
+        let size = export.buffer_size();
+
+        let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
+        if let (true, Some(output)) = (export.overlay_cursor(), output) {
+            if let Some((_, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
+                let pos = win_pos.to_physical_precise_round(scale).upscale(-1);
+                self.render_pointer(renderer, output, &mut |elem| {
+                    let elem = RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
+                    elements.push(elem.into());
+                });
+            }
+        }
+        let ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::ScreenCapture,
+            xray: None,
+        };
+        // Visual geometry at the buffer origin; popups and CSD shadows outside it are cut off.
+        mapped.render(
+            ctx,
+            Point::from((0., 0.)),
+            scale,
+            1.,
+            XrayPos::default(),
+            &mut |elem| elements.push(elem.into()),
+        );
+
+        let mut damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
+        let (_damage, states) = damage_tracker.damage_output(1, &elements)?;
+        let sync = match export.buffer() {
+            ExportBuffer::Dmabuf(dmabuf) => Some(
+                render_to_dmabuf(
+                    renderer,
+                    &mut damage_tracker,
+                    dmabuf.clone(),
+                    &elements,
+                    states,
+                )
+                .context("error rendering to toplevel export dmabuf")?,
+            ),
+            ExportBuffer::Shm(wl_buffer) => {
+                render_to_shm(renderer, &mut damage_tracker, wl_buffer, &elements, states)
+                    .context("error rendering to toplevel export shm buffer")?;
+                None
+            }
+        };
+        export.submit_after_sync(sync, &self.event_loop);
+        Ok(())
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]

@@ -23,7 +23,7 @@ use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_scre
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Serial, Size};
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_lease::{
@@ -74,7 +74,7 @@ use smithay::{
 
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::layout::workspace::WorkspaceId;
-use crate::layout::ActivateWindow;
+use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{DndIcon, NewClient, State};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceHandler, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{
@@ -84,6 +84,9 @@ use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerSt
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
 use crate::protocols::screencopy::{Screencopy, ScreencopyHandler, ScreencopyManagerState};
+use crate::protocols::toplevel_export::{
+    ToplevelExport, ToplevelExportHandler, ToplevelExportManagerState,
+};
 use crate::protocols::virtual_pointer::{
     VirtualPointerAxisEvent, VirtualPointerButtonEvent, VirtualPointerHandler,
     VirtualPointerInputBackend, VirtualPointerManagerState, VirtualPointerMotionAbsoluteEvent,
@@ -93,7 +96,7 @@ use crate::utils::{output_size, send_scale_transform};
 use crate::{
     delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
     delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
-    delegate_virtual_pointer,
+    delegate_toplevel_export, delegate_virtual_pointer,
 };
 
 pub const XDG_ACTIVATION_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -662,6 +665,67 @@ impl ScreencopyHandler for State {
     }
 }
 delegate_screencopy!(State);
+
+impl ToplevelExportHandler for State {
+    fn toplevel_export_state(&mut self) -> &mut ToplevelExportManagerState {
+        &mut self.niri.toplevel_export_state
+    }
+
+    fn surface_for_wlr_handle(
+        &mut self,
+        handle: &smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1,
+    ) -> Option<WlSurface> {
+        self.niri
+            .foreign_toplevel_state
+            .surface_for_wlr_handle(handle)
+    }
+
+    fn surface_for_window_id(&mut self, id: u64) -> Option<WlSurface> {
+        self.niri
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.id().get() == id)
+            .map(|(_, mapped)| mapped.toplevel().wl_surface().clone())
+    }
+
+    fn export_size(&mut self, surface: &WlSurface) -> Option<Size<i32, Physical>> {
+        let (mapped, output) = self.niri.layout.find_window_and_output(surface)?;
+        let scale = output.map_or(1., |o| o.current_scale().fractional_scale());
+        let size = mapped.size().to_physical_precise_round(scale);
+        (size.w > 0 && size.h > 0).then_some(size)
+    }
+
+    fn export_frame(&mut self, export: ToplevelExport, ignore_damage: bool) {
+        if !ignore_damage {
+            // Wait for the window to commit new contents (see the compositor commit handler).
+            self.niri.toplevel_export_state.push(export);
+            return;
+        }
+        self.backend.with_primary_renderer(|renderer| {
+            if let Err(err) = self.niri.render_toplevel_export(renderer, export) {
+                warn!("error rendering toplevel export: {err:?}");
+            }
+        });
+    }
+}
+delegate_toplevel_export!(State);
+
+impl State {
+    /// Render the window copies that were waiting for this toplevel to commit.
+    pub fn render_waiting_toplevel_exports(&mut self, surface: &WlSurface) {
+        let exports = self.niri.toplevel_export_state.take_for(surface);
+        if exports.is_empty() {
+            return;
+        }
+        self.backend.with_primary_renderer(|renderer| {
+            for export in exports {
+                if let Err(err) = self.niri.render_toplevel_export(renderer, export) {
+                    warn!("error rendering toplevel export: {err:?}");
+                }
+            }
+        });
+    }
+}
 
 impl VirtualPointerHandler for State {
     fn virtual_pointer_manager_state(&mut self) -> &mut VirtualPointerManagerState {
