@@ -3498,7 +3498,7 @@ checksum = "b7c388c1b5e93756d0c740965c41e8822f866621d41acbdf6336a6a168f8840c"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/Smithay/smithay.git?rev=ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef#ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+source = "git+https://github.com/velddev/smithay.git?branch=pond%2Ffewer-fences#21e1a5682ee594aa1e94839487eb32deccb1d134"
 dependencies = [
  "aliasable",
  "appendlist",

@@ -37,6 +37,12 @@ git = "https://github.com/Smithay/smithay.git"
 rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
 # path = "../smithay/smithay-drm-extras"
 
+# Pond: smithay with fewer GL sync objects. NVIDIA 615 keeps 16 bytes per sync
+# object forever, and stock smithay fences every textured draw (niri grew ~1.5 GB/day).
+# The branch is upstream rev ff5fa7d plus one commit; rebase it when bumping smithay.
+[patch."https://github.com/Smithay/smithay.git"]
+smithay = { git = "https://github.com/velddev/smithay.git", branch = "pond/fewer-fences" }
+
 [package]
 name = "niri"
 version.workspace = true
