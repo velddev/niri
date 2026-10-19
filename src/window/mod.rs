@@ -120,6 +120,10 @@ pub struct ResolvedWindowRules {
     /// Override whether to set the Tiled xdg-toplevel state on the window.
     pub tiled_state: Option<bool>,
 
+    /// Whether to keep sending frame callbacks at the output refresh rate while the window is
+    /// not visible (on another workspace, scrolled out of view).
+    pub frame_callbacks_when_hidden: Option<bool>,
+
     /// Background effect configuration.
     pub background_effect: BackgroundEffect,
 
@@ -301,6 +305,9 @@ impl ResolvedWindowRules {
                 }
                 if let Some(x) = rule.tiled_state {
                     resolved.tiled_state = Some(x);
+                }
+                if let Some(x) = rule.frame_callbacks_when_hidden {
+                    resolved.frame_callbacks_when_hidden = Some(x);
                 }
 
                 resolved

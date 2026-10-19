@@ -58,6 +58,7 @@ window-rule {
     default-column-display "tabbed"
     default-floating-position x=100 y=200 relative-to="bottom-left"
     scroll-factor 0.75
+    frame-callbacks-when-hidden true
 
     focus-ring {
         // off
@@ -634,6 +635,23 @@ window-rule {
     match app-id="^mpv$"
 
     variable-refresh-rate true
+}
+```
+
+#### `frame-callbacks-when-hidden`
+
+If set to true, this window keeps receiving frame callbacks at its output's refresh rate while it is not visible: on another workspace, or scrolled out of view.
+By default, hidden windows only get a frame callback about once per second, so clients that draw in response to frame callbacks almost stop.
+
+The hidden window is not rendered, so this costs little, but the client keeps drawing at full rate.
+Useful for nested compositors or anything you capture while it's out of sight.
+
+```kdl
+// Keep nested niri sessions running at full rate on a hidden workspace.
+window-rule {
+    match app-id="^niri$"
+
+    frame-callbacks-when-hidden true
 }
 ```
 
