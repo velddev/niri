@@ -2341,6 +2341,23 @@ impl<W: LayoutElement> Layout<W> {
         mon.resize_edges_under(pos_within_output)
     }
 
+    /// The window and edges to resize from a point in the gap next to a tile.
+    ///
+    /// Only meaningful where nothing else (a window, a layer surface) is under the point; see
+    /// Workspace::edge_resize_under().
+    pub fn edge_resize_under(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, ResizeEdge)> {
+        if self.interactive_move.is_some() {
+            return None;
+        }
+
+        let mon = self.monitor_for_output(output)?;
+        mon.edge_resize_under(pos_within_output)
+    }
+
     pub fn workspace_under(
         &self,
         extended_bounds: bool,

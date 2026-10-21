@@ -181,7 +181,7 @@ use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland,
+    send_scale_transform, write_png_rgba8, xwayland, ResizeEdge,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -541,6 +541,9 @@ pub struct PointContents {
     pub layer: Option<LayerSurface>,
     // Pointer is over a hot corner.
     pub hot_corner: bool,
+    // Pointer is in the gap next to a window's edge, where a click starts resizing it from these
+    // edges. Only set when nothing else (a window, a layer surface) is under the pointer.
+    pub edge_resize: Option<(Window, ResizeEdge)>,
 }
 
 #[derive(Debug, Default)]
@@ -1084,6 +1087,7 @@ impl State {
             }
         }
 
+        let prev_edge_resize = self.niri.pointer_contents.edge_resize.as_ref().map(|x| x.1);
         self.niri.pointer_contents.clone_from(&under);
 
         pointer.motion(
@@ -1096,9 +1100,38 @@ impl State {
             },
         );
 
+        self.update_edge_resize_cursor(prev_edge_resize);
+
         self.niri.maybe_activate_pointer_constraint();
 
         true
+    }
+
+    /// Shows the resize cursor while the pointer is in a resize zone next to a window's edge.
+    ///
+    /// Call after pointer.motion() with the zone edges from before the pointer contents changed.
+    /// Entering a zone sets the matching resize cursor; leaving one restores the default cursor
+    /// (a client the pointer enters sets its own right after). Grabs own the cursor, so this does
+    /// nothing while one is active.
+    pub fn update_edge_resize_cursor(&mut self, prev: Option<ResizeEdge>) {
+        let current = self.niri.pointer_contents.edge_resize.as_ref().map(|x| x.1);
+        if current == prev {
+            return;
+        }
+
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        if pointer.is_grabbed() {
+            return;
+        }
+
+        let image = match current {
+            Some(edges) => CursorImageStatus::Named(edges.cursor_icon()),
+            None => CursorImageStatus::default_named(),
+        };
+        trace!("edge resize cursor: {current:?}");
+        self.niri.cursor_manager.set_cursor_image(image);
+        // FIXME: granular.
+        self.niri.queue_redraw_all();
     }
 
     pub fn move_cursor_to_output(&mut self, output: &Output) {
@@ -3406,6 +3439,12 @@ impl Niri {
                 .map(mapped_hit_data)
         };
 
+        let edge_resize_under = || {
+            self.layout
+                .edge_resize_under(output, pos_within_output)
+                .map(|(mapped, edges)| (mapped.window.clone(), edges))
+        };
+
         let mon = self.layout.monitor_for_output(output).unwrap();
 
         let mut under =
@@ -3420,7 +3459,16 @@ impl Niri {
                 .or_else(interactive_moved_window_under)
                 .or_else(window_under)
                 .or_else(|| layer_popup_under(Layer::Top))
-                .or_else(|| layer_toplevel_under(Layer::Top))
+                .or_else(|| layer_toplevel_under(Layer::Top));
+
+            if under.is_none() {
+                if let Some(edge_resize) = edge_resize_under() {
+                    rv.edge_resize = Some(edge_resize);
+                    return rv;
+                }
+            }
+
+            under = under
                 .or_else(|| layer_popup_under(Layer::Bottom))
                 .or_else(|| layer_popup_under(Layer::Background))
                 .or_else(|| layer_toplevel_under(Layer::Bottom))
@@ -3444,6 +3492,15 @@ impl Niri {
             }
 
             under = under.or_else(window_under);
+
+            // The gaps next to windows resize them. This goes above the bottom and background
+            // layers, which are usually under every gap.
+            if under.is_none() {
+                if let Some(edge_resize) = edge_resize_under() {
+                    rv.edge_resize = Some(edge_resize);
+                    return rv;
+                }
+            }
 
             if !is_overview_open {
                 under = under

@@ -1584,6 +1584,21 @@ impl<W: LayoutElement> Monitor<W> {
         ws.resize_edges_under(pos_within_output - geo.loc)
     }
 
+    /// The window and edges to resize from a point in a gap, see Workspace::edge_resize_under().
+    ///
+    /// There are no resize zones in the overview.
+    pub fn edge_resize_under(
+        &self,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, ResizeEdge)> {
+        if self.overview_progress.is_some() {
+            return None;
+        }
+
+        let (ws, geo) = self.workspace_under(pos_within_output)?;
+        ws.edge_resize_under(pos_within_output - geo.loc)
+    }
+
     pub(super) fn insert_position(
         &self,
         pos_within_output: Point<f64, Logical>,

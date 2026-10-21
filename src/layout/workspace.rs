@@ -1800,6 +1800,54 @@ impl<W: LayoutElement> Workspace<W> {
             })
     }
 
+    /// The window and edges to resize from a point in the gap next to a tile.
+    ///
+    /// The resize zone of a tile extends `max(gaps, MIN_EDGE_RESIZE_ZONE)` outward from each of
+    /// its edges and corners. It never covers a tile: the caller only asks for points that
+    /// window_under() returned `None` for (and that no other surface covers). Where zones overlap,
+    /// as in the gap shared by two tiles, the nearest tile that can be resized wins. Edges that
+    /// can't change anything are left out: see ScrollingSpace::edge_resize_targets() and
+    /// resizable_edges().
+    pub fn edge_resize_under(&self, pos: Point<f64, Logical>) -> Option<(&W, ResizeEdge)> {
+        let zone = f64::max(self.options.layout.gaps, MIN_EDGE_RESIZE_ZONE);
+
+        // This logic is consistent with window_under().
+        let floating = self
+            .is_floating_visible()
+            .then(|| {
+                self.floating
+                    .tiles_with_render_positions()
+                    .filter(|(tile, _)| tile.sizing_mode().is_normal())
+                    .map(|(tile, tile_pos)| (tile, tile_pos, ResizeEdge::all()))
+            })
+            .into_iter()
+            .flatten();
+        let scrolling = self.scrolling.edge_resize_targets();
+
+        let mut best: Option<(&W, ResizeEdge, f64)> = None;
+        for (tile, tile_pos, edges) in floating.chain(scrolling) {
+            if !tile.sizing_mode().is_normal() {
+                continue;
+            }
+
+            let rect = Rectangle::new(tile_pos + tile.bob_offset(), tile.tile_size());
+            let Some((hit, dist)) = edge_zone_hit(rect, pos, zone) else {
+                continue;
+            };
+
+            let edges = hit & edges & resizable_edges(tile);
+            if edges.is_empty() {
+                continue;
+            }
+
+            if best.is_none_or(|(_, _, best_dist)| dist < best_dist) {
+                best = Some((tile.window(), edges, dist));
+            }
+        }
+
+        best.map(|(win, edges, _)| (win, edges))
+    }
+
     pub fn descendants_added(&mut self, id: &W::Id) -> bool {
         self.floating.descendants_added(id)
     }
@@ -2081,4 +2129,64 @@ fn compute_workspace_shadow_config(
     config.offset.y.0 *= norm;
 
     config
+}
+
+/// Minimum width of the resize zone next to a tile's edges, for layouts with tiny or no gaps.
+pub(super) const MIN_EDGE_RESIZE_ZONE: f64 = 4.;
+
+/// Which edges of `rect` a point in its resize zone grabs, and how far the point is from `rect`.
+///
+/// The zone is the band `zone` wide around the outside of `rect`, corners included. Points inside
+/// `rect` or beyond the band return `None`.
+pub(super) fn edge_zone_hit(
+    rect: Rectangle<f64, Logical>,
+    pos: Point<f64, Logical>,
+    zone: f64,
+) -> Option<(ResizeEdge, f64)> {
+    let left = rect.loc.x;
+    let top = rect.loc.y;
+    let right = rect.loc.x + rect.size.w;
+    let bottom = rect.loc.y + rect.size.h;
+
+    // Same convention as Rectangle::contains(): the right and bottom edges are outside.
+    let mut edges = ResizeEdge::empty();
+    let mut dx = 0.;
+    let mut dy = 0.;
+    if pos.x < left {
+        edges |= ResizeEdge::LEFT;
+        dx = left - pos.x;
+    } else if pos.x >= right {
+        edges |= ResizeEdge::RIGHT;
+        dx = pos.x - right;
+    }
+    if pos.y < top {
+        edges |= ResizeEdge::TOP;
+        dy = top - pos.y;
+    } else if pos.y >= bottom {
+        edges |= ResizeEdge::BOTTOM;
+        dy = pos.y - bottom;
+    }
+
+    if edges.is_empty() || dx > zone || dy > zone {
+        return None;
+    }
+
+    Some((edges, f64::hypot(dx, dy)))
+}
+
+/// Edges along which the tile's window can change size at all.
+///
+/// A window whose min and max size are equal on an axis can't be resized along it.
+fn resizable_edges<W: LayoutElement>(tile: &Tile<W>) -> ResizeEdge {
+    let min = tile.window().min_size();
+    let max = tile.window().max_size();
+
+    let mut edges = ResizeEdge::all();
+    if max.w > 0 && min.w == max.w {
+        edges.remove(ResizeEdge::LEFT_RIGHT);
+    }
+    if max.h > 0 && min.h == max.h {
+        edges.remove(ResizeEdge::TOP_BOTTOM);
+    }
+    edges
 }

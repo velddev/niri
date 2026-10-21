@@ -3009,6 +3009,46 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         None
     }
 
+    /// Visible tiles with their render positions and the edges an interactive resize could move.
+    ///
+    /// Used for the resize zones in the gaps around tiles. Columns that can't be resized
+    /// interactively (fullscreen, maximized) are skipped. A column's only visible window has no
+    /// height of its own to change, so it offers left and right only; the topmost window's top
+    /// edge is left out too, because interactive_resize_update() ignores it.
+    pub fn edge_resize_targets(
+        &self,
+    ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>, ResizeEdge)> {
+        let scale = self.scale;
+        let view_off = Point::from((-self.view_pos(), 0.));
+        zip(&self.columns, self.column_xs(self.data.iter().copied()))
+            .filter(|(col, _)| col.pending_sizing_mode().is_normal())
+            .flat_map(move |(col, col_x)| {
+                let col_off = Point::from((col_x, 0.));
+                let col_render_off = col.render_offset();
+                let tabbed = col.display_mode == ColumnDisplay::Tabbed;
+                let stacked = !tabbed && col.tiles.len() > 1;
+                let active_idx = col.active_tile_idx;
+                col.tiles()
+                    .enumerate()
+                    .filter(move |(idx, _)| !tabbed || *idx == active_idx)
+                    .map(move |(idx, (tile, tile_off))| {
+                        let pos =
+                            view_off + col_off + col_render_off + tile_off + tile.render_offset();
+                        // Round to physical pixels, like window_under().
+                        let pos = pos.to_physical_precise_round(scale).to_logical(scale);
+
+                        let mut edges = ResizeEdge::LEFT_RIGHT;
+                        if stacked {
+                            edges |= ResizeEdge::BOTTOM;
+                            if idx > 0 {
+                                edges |= ResizeEdge::TOP;
+                            }
+                        }
+                        (tile, pos, edges)
+                    })
+            })
+    }
+
     pub fn view_offset_gesture_begin(&mut self, is_touchpad: bool) {
         if self.columns.is_empty() {
             return;

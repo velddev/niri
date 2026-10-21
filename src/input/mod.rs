@@ -19,6 +19,7 @@ use smithay::backend::input::{
     TabletToolTipState, TouchEvent,
 };
 use smithay::backend::libinput::LibinputInputBackend;
+use smithay::desktop::Window;
 use smithay::input::dnd::DnDGrab;
 use smithay::input::keyboard::{keysyms, FilterResult, Keysym, Layout, ModifiersState};
 use smithay::input::pointer::{
@@ -34,7 +35,7 @@ use smithay::input::SeatHandler;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Rectangle, Serial, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
@@ -2626,6 +2627,7 @@ impl State {
 
         self.niri.handle_focus_follows_mouse(&under);
 
+        let prev_edge_resize = self.niri.pointer_contents.edge_resize.as_ref().map(|x| x.1);
         self.niri.pointer_contents.clone_from(&under);
 
         pointer.motion(
@@ -2647,6 +2649,8 @@ impl State {
                 utime: event.time(),
             },
         );
+
+        self.update_edge_resize_cursor(prev_edge_resize);
 
         pointer.frame(self);
 
@@ -2729,6 +2733,7 @@ impl State {
 
         self.niri.handle_focus_follows_mouse(&under);
 
+        let prev_edge_resize = self.niri.pointer_contents.edge_resize.as_ref().map(|x| x.1);
         self.niri.pointer_contents.clone_from(&under);
 
         pointer.motion(
@@ -2740,6 +2745,8 @@ impl State {
                 time: event.time_msec(),
             },
         );
+
+        self.update_edge_resize_cursor(prev_edge_resize);
 
         pointer.frame(self);
 
@@ -2778,6 +2785,88 @@ impl State {
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
         self.niri.queue_redraw_all();
+    }
+
+    /// Starts an interactive pointer resize of `window` from `edges`.
+    ///
+    /// This is what Mod+RMB on a window and a press in the resize zone next to its edge both do.
+    /// A second resize click on the same edges within DOUBLE_CLICK_TIME runs a gesture instead:
+    /// left/right edges toggle full width, top/bottom edges reset the window height. Returns
+    /// `true` for a gesture, after which the caller shouldn't pass the press on.
+    fn pointer_resize_begin(
+        &mut self,
+        window: &Window,
+        edges: ResizeEdge,
+        button_code: u32,
+        serial: Serial,
+    ) -> bool {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        let location = pointer.current_location();
+
+        let Some((_, mapped)) = self
+            .niri
+            .layout
+            .windows()
+            .find(|(_, m)| &m.window == window)
+        else {
+            return false;
+        };
+
+        // See if we got a double resize-click gesture.
+        // FIXME: deduplicate with resize_request in xdg-shell somehow.
+        let time = get_monotonic_time();
+        let last_cell = mapped.last_interactive_resize_start();
+        let mut last = last_cell.get();
+        last_cell.set(Some((time, edges)));
+
+        // Floating windows don't have either of the double-resize-click gestures, so just allow
+        // it to resize.
+        if mapped.is_floating() {
+            last = None;
+            last_cell.set(None);
+        }
+
+        if let Some((last_time, last_edges)) = last {
+            if time.saturating_sub(last_time) <= DOUBLE_CLICK_TIME {
+                // Allow quick resize after a triple click.
+                last_cell.set(None);
+
+                let intersection = edges.intersection(last_edges);
+                if intersection.intersects(ResizeEdge::LEFT_RIGHT) {
+                    // FIXME: don't activate once we can pass specific windows to actions.
+                    self.niri.layout.activate_window(window);
+                    self.niri.layout.toggle_full_width();
+                }
+                if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
+                    self.niri.layout.activate_window(window);
+                    self.niri.layout.reset_window_height(Some(window));
+                }
+                // FIXME: granular.
+                self.niri.queue_redraw_all();
+                return true;
+            }
+        }
+
+        self.niri.layout.activate_window(window);
+
+        if self
+            .niri
+            .layout
+            .interactive_resize_begin(window.clone(), edges)
+        {
+            let start_data = PointerGrabStartData {
+                focus: None,
+                button: button_code,
+                location,
+            };
+            let grab = ResizeGrab::new(start_data, window.clone());
+            pointer.set_grab(self, grab, serial, Focus::Clear);
+            self.niri
+                .cursor_manager
+                .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
+        }
+
+        false
     }
 
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
@@ -2920,7 +3009,29 @@ impl State {
                 }
             }
 
-            if let Some(mapped) = self.niri.window_under_cursor() {
+            // A press in the gap next to a window's edge resizes the window, like Mod+RMB on it.
+            // contents_under() only reports a resize zone where no window or layer surface is
+            // under the pointer, so this never takes a click away from a client.
+            let edge_resize = if !pointer.is_grabbed()
+                && (button == Some(MouseButton::Left)
+                    || (button == Some(MouseButton::Right)
+                        && modifiers_from_state(mods).contains(mod_key.to_modifiers())))
+            {
+                let location = pointer.current_location();
+                self.niri.contents_under(location).edge_resize
+            } else {
+                None
+            };
+
+            if let Some((window, edges)) = edge_resize {
+                if self.pointer_resize_begin(&window, edges, button_code, serial) {
+                    // A double resize-click gesture.
+                    return;
+                }
+
+                // FIXME: granular.
+                self.niri.queue_redraw_all();
+            } else if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
 
                 // Check if we need to start an interactive move.
@@ -2970,61 +3081,11 @@ impl State {
                             .resize_edges_under(output, pos_within_output)
                             .unwrap_or(ResizeEdge::empty());
 
-                        if !edges.is_empty() {
-                            // See if we got a double resize-click gesture.
-                            // FIXME: deduplicate with resize_request in xdg-shell somehow.
-                            let time = get_monotonic_time();
-                            let last_cell = mapped.last_interactive_resize_start();
-                            let mut last = last_cell.get();
-                            last_cell.set(Some((time, edges)));
-
-                            // Floating windows don't have either of the double-resize-click
-                            // gestures, so just allow it to resize.
-                            if mapped.is_floating() {
-                                last = None;
-                                last_cell.set(None);
-                            }
-
-                            if let Some((last_time, last_edges)) = last {
-                                if time.saturating_sub(last_time) <= DOUBLE_CLICK_TIME {
-                                    // Allow quick resize after a triple click.
-                                    last_cell.set(None);
-
-                                    let intersection = edges.intersection(last_edges);
-                                    if intersection.intersects(ResizeEdge::LEFT_RIGHT) {
-                                        // FIXME: don't activate once we can pass specific windows
-                                        // to actions.
-                                        self.niri.layout.activate_window(&window);
-                                        self.niri.layout.toggle_full_width();
-                                    }
-                                    if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
-                                        self.niri.layout.activate_window(&window);
-                                        self.niri.layout.reset_window_height(Some(&window));
-                                    }
-                                    // FIXME: granular.
-                                    self.niri.queue_redraw_all();
-                                    return;
-                                }
-                            }
-
-                            self.niri.layout.activate_window(&window);
-
-                            if self
-                                .niri
-                                .layout
-                                .interactive_resize_begin(window.clone(), edges)
-                            {
-                                let start_data = PointerGrabStartData {
-                                    focus: None,
-                                    button: button_code,
-                                    location,
-                                };
-                                let grab = ResizeGrab::new(start_data, window.clone());
-                                pointer.set_grab(self, grab, serial, Focus::Clear);
-                                self.niri.cursor_manager.set_cursor_image(
-                                    CursorImageStatus::Named(edges.cursor_icon()),
-                                );
-                            }
+                        if !edges.is_empty()
+                            && self.pointer_resize_begin(&window, edges, button_code, serial)
+                        {
+                            // A double resize-click gesture.
+                            return;
                         }
                     }
                 }

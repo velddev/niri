@@ -22,10 +22,14 @@ impl ResizeGrab {
 
     fn on_ungrab(&mut self, state: &mut State) {
         state.niri.layout.interactive_resize_end(&self.window);
-        state
-            .niri
-            .cursor_manager
-            .set_cursor_image(CursorImageStatus::default_named());
+
+        // If the resize ended with the pointer in a resize zone (as it usually does after
+        // dragging from one), keep showing that zone's cursor.
+        let image = match &state.niri.pointer_contents.edge_resize {
+            Some((_, edges)) => CursorImageStatus::Named(edges.cursor_icon()),
+            None => CursorImageStatus::default_named(),
+        };
+        state.niri.cursor_manager.set_cursor_image(image);
     }
 }
 
