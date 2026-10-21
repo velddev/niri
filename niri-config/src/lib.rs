@@ -733,6 +733,7 @@ mod tests {
                 warp-mouse-to-focus
                 focus-follows-mouse
                 workspace-auto-back-and-forth
+                scroll-binds-follow-pointer false
 
                 mod-key "Mod5"
                 mod-key-nested "Super"
@@ -1134,6 +1135,7 @@ mod tests {
                     },
                 ),
                 workspace_auto_back_and_forth: true,
+                scroll_binds_follow_pointer: false,
                 mod_key: Some(
                     IsoLevel3Shift,
                 ),

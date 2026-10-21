@@ -8,7 +8,7 @@ use crate::binds::Modifiers;
 use crate::utils::{Flag, MergeWith, Percent};
 use crate::FloatOrInt;
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Input {
     pub keyboard: Keyboard,
     pub touchpad: Touchpad,
@@ -21,8 +21,30 @@ pub struct Input {
     pub warp_mouse_to_focus: Option<WarpMouseToFocus>,
     pub focus_follows_mouse: Option<FocusFollowsMouse>,
     pub workspace_auto_back_and_forth: bool,
+    pub scroll_binds_follow_pointer: bool,
     pub mod_key: Option<ModKey>,
     pub mod_key_nested: Option<ModKey>,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self {
+            keyboard: Keyboard::default(),
+            touchpad: Touchpad::default(),
+            mouse: Mouse::default(),
+            trackpoint: Trackpoint::default(),
+            trackball: Trackball::default(),
+            tablet: Tablet::default(),
+            touch: Touch::default(),
+            disable_power_key_handling: false,
+            warp_mouse_to_focus: None,
+            focus_follows_mouse: None,
+            workspace_auto_back_and_forth: false,
+            scroll_binds_follow_pointer: true,
+            mod_key: None,
+            mod_key_nested: None,
+        }
+    }
 }
 
 #[derive(knuffel::Decode, Debug, Default, PartialEq)]
@@ -49,6 +71,8 @@ pub struct InputPart {
     pub focus_follows_mouse: Option<FocusFollowsMouse>,
     #[knuffel(child)]
     pub workspace_auto_back_and_forth: Option<Flag>,
+    #[knuffel(child)]
+    pub scroll_binds_follow_pointer: Option<Flag>,
     #[knuffel(child, unwrap(argument, str))]
     pub mod_key: Option<ModKey>,
     #[knuffel(child, unwrap(argument, str))]
@@ -62,6 +86,7 @@ impl MergeWith<InputPart> for Input {
             keyboard,
             disable_power_key_handling,
             workspace_auto_back_and_forth,
+            scroll_binds_follow_pointer,
         );
 
         merge_clone!(

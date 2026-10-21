@@ -647,6 +647,53 @@ impl State {
         }
     }
 
+    /// Runs the bind for a scroll that accumulated `ticks` (negative for `neg`, positive for
+    /// `pos`).
+    ///
+    /// With `follow_pointer`, and `scroll-binds-follow-pointer` enabled, the output under the
+    /// pointer is focused first, so that the bind acts where the pointer is.
+    fn handle_scroll_bind(
+        &mut self,
+        ticks: i8,
+        neg: Option<Bind>,
+        pos: Option<Bind>,
+        follow_pointer: bool,
+    ) {
+        let bind = if ticks < 0 { neg } else { pos };
+        let Some(bind) = bind else {
+            return;
+        };
+
+        if follow_pointer {
+            self.focus_output_under_pointer_for_scroll_bind();
+        }
+
+        for _ in 0..ticks.unsigned_abs() {
+            self.handle_bind(bind.clone());
+        }
+    }
+
+    fn focus_output_under_pointer_for_scroll_bind(&mut self) {
+        if !self.niri.config.borrow().input.scroll_binds_follow_pointer {
+            return;
+        }
+
+        // The recent windows switcher binds act on the switcher itself.
+        if self.niri.is_locked() || self.niri.window_mru_ui.is_open() {
+            return;
+        }
+
+        let Some(output) = self.niri.output_under_cursor() else {
+            return;
+        };
+
+        if self.niri.layout.active_output() != Some(&output) {
+            self.niri.layout.focus_output(&output);
+            // FIXME: granular.
+            self.niri.queue_redraw_all();
+        }
+    }
+
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
         if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
             return;
@@ -3156,16 +3203,9 @@ impl State {
                             (bind_left, bind_right)
                         };
 
-                    if let Some(right) = bind_right {
-                        for _ in 0..ticks {
-                            self.handle_bind(right.clone());
-                        }
-                    }
-                    if let Some(left) = bind_left {
-                        for _ in ticks..0 {
-                            self.handle_bind(left.clone());
-                        }
-                    }
+                    // The built-in overview binds already act under the mouse.
+                    let follow_pointer = !(should_handle_in_overview && modifiers.is_empty());
+                    self.handle_scroll_bind(ticks, bind_left, bind_right, follow_pointer);
                 }
 
                 let vertical = vertical_amount_v120.unwrap_or(0.);
@@ -3239,16 +3279,9 @@ impl State {
                         (bind_up, bind_down)
                     };
 
-                    if let Some(down) = bind_down {
-                        for _ in 0..ticks {
-                            self.handle_bind(down.clone());
-                        }
-                    }
-                    if let Some(up) = bind_up {
-                        for _ in ticks..0 {
-                            self.handle_bind(up.clone());
-                        }
-                    }
+                    let follow_pointer = !(should_handle_in_overview
+                        && (modifiers.is_empty() || modifiers == Modifiers::SHIFT));
+                    self.handle_scroll_bind(ticks, bind_up, bind_down, follow_pointer);
                 }
 
                 return;
@@ -3383,16 +3416,7 @@ impl State {
                         find_configured_bind(bindings, mod_key, Trigger::TouchpadScrollRight, mods);
                     drop(config);
 
-                    if let Some(right) = bind_right {
-                        for _ in 0..ticks {
-                            self.handle_bind(right.clone());
-                        }
-                    }
-                    if let Some(left) = bind_left {
-                        for _ in ticks..0 {
-                            self.handle_bind(left.clone());
-                        }
-                    }
+                    self.handle_scroll_bind(ticks, bind_left, bind_right, true);
                 }
 
                 let ticks = self
@@ -3413,16 +3437,7 @@ impl State {
                         find_configured_bind(bindings, mod_key, Trigger::TouchpadScrollDown, mods);
                     drop(config);
 
-                    if let Some(down) = bind_down {
-                        for _ in 0..ticks {
-                            self.handle_bind(down.clone());
-                        }
-                    }
-                    if let Some(up) = bind_up {
-                        for _ in ticks..0 {
-                            self.handle_bind(up.clone());
-                        }
-                    }
+                    self.handle_scroll_bind(ticks, bind_up, bind_down, true);
                 }
 
                 return;

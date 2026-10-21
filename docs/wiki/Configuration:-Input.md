@@ -104,6 +104,7 @@ input {
     // warp-mouse-to-focus
     // focus-follows-mouse max-scroll-amount="0%"
     // workspace-auto-back-and-forth
+    // scroll-binds-follow-pointer false
 
     // mod-key "Super"
     // mod-key-nested "Alt"
@@ -366,6 +367,24 @@ Niri will correctly switch to the workspace you came from, even if workspaces we
 ```kdl
 input {
     workspace-auto-back-and-forth
+}
+```
+
+#### `scroll-binds-follow-pointer`
+
+<sup>Since: next release</sup>
+
+Controls which monitor [scroll bindings](./Configuration:-Key-Bindings.md#scroll-bindings) act on.
+
+By default, a mouse wheel or touchpad scroll bind (like `Mod+WheelScrollDown`) first focuses the monitor under the mouse pointer, then runs its action there.
+This way, `Mod`+scrolling over a monitor switches workspaces on that monitor, even when [`focus-follows-mouse`](#focus-follows-mouse) is off.
+Simply moving the pointer still doesn't change focus, and neither do keyboard binds.
+
+Set this to `false` to make scroll binds act on the focused monitor instead.
+
+```kdl
+input {
+    scroll-binds-follow-pointer false
 }
 ```
 

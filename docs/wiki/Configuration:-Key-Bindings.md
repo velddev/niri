@@ -110,6 +110,9 @@ binds {
 Both mouse wheel and touchpad scroll binds will prevent applications from receiving any scroll events when their modifiers are held down.
 For example, if you have a `Mod+WheelScrollDown` bind, then while holding `Mod`, all mouse wheel scrolling will be consumed by niri.
 
+Scroll binds act on the monitor under the mouse pointer: niri focuses that monitor before running the action.
+You can turn this off with [`scroll-binds-follow-pointer false`](./Configuration:-Input.md#scroll-binds-follow-pointer).
+
 ### Mouse Click Bindings
 
 <sup>Since: 25.01</sup>
