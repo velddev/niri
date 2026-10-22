@@ -35,6 +35,7 @@ layer-rule {
     geometry-corner-radius 12
     place-within-backdrop true
     baba-is-float true
+    dismissable true
 
     background-effect {
         xray true
@@ -292,3 +293,36 @@ layer-rule {
 
 Keep in mind that the background effect will look right only if the pop-up is shaped like a (rounded) rectangle, and the layer surface correctly sets its Wayland geometry to exclude any shadows.
 Pop-ups with custom shapes will need the app to implement the [ext-background-effect protocol](https://wayland.app/protocols/ext-background-effect-v1) to work properly.
+
+#### `dismissable`
+
+Mark the surface as a dismissable pop-up, like a launcher, a dropdown or an assistant card that should go away when you click elsewhere or press Escape, without having to give it keyboard focus first.
+niri doesn't close the surface itself: it tells the client over [IPC](./IPC.md), with a `LayerDismissRequested` event on the event stream that carries the surface's namespace, its output and the reason (`Pointer` or `Escape`).
+
+While at least one matching surface is mapped:
+
+- A mouse button press anywhere outside it (on a window, another layer surface or empty space) is delivered as usual, and niri also sends the event with reason `Pointer`.
+  A press on the surface itself or one of its pop-ups sends nothing.
+- Escape without modifiers, while keyboard focus is somewhere else, is consumed (the focused window doesn't get it) and niri sends the event with reason `Escape`.
+  If the dismissable surface itself has keyboard focus, Escape goes to it as usual and nothing is sent.
+  Binds win: if you bind Escape, the bind runs instead.
+
+Nothing is sent and Escape is never consumed while the screen is locked, the overview, the screenshot UI or the window switcher is open, a pointer grab is active (an interactive move or resize, a held mouse button, a pop-up grab), or the focused surface inhibits keyboard shortcuts.
+A surface whose input region is empty (it is fully click-through, for example while it animates out) does not count as mapped here.
+
+Unlike `exclusive` keyboard interactivity, this never takes keyboard focus away from the window you're in.
+
+```kdl
+// Close the assistant card on a click outside it or on Escape.
+layer-rule {
+    match namespace="^pond-miki$"
+
+    dismissable true
+}
+```
+
+The client listens on the event stream, for example:
+
+```sh
+niri msg --json event-stream | grep LayerDismissRequested
+```

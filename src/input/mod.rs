@@ -9,7 +9,7 @@ use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
     Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
 };
-use niri_ipc::LayoutSwitchTarget;
+use niri_ipc::{LayerDismissReason, LayoutSwitchTarget};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
@@ -536,6 +536,22 @@ impl State {
                         {
                             this.niri.suppressed_keys.insert(key_code);
                             return FilterResult::Intercept(Some(bind));
+                        }
+                    }
+
+                    // An unbound Escape closes dismissable layer surfaces (the layer rule) when
+                    // the keyboard focus is somewhere else. Then the focused surface doesn't get
+                    // it.
+                    if pressed
+                        && raw == Some(Keysym::Escape)
+                        && modifiers.is_empty()
+                        && !is_inhibiting_shortcuts
+                    {
+                        let targets = this.niri.layers_to_dismiss_on_escape();
+                        if !targets.is_empty() {
+                            this.request_layer_dismiss(targets, LayerDismissReason::Escape);
+                            this.niri.suppressed_keys.insert(key_code);
+                            return FilterResult::Intercept(None);
                         }
                     }
 
@@ -2888,6 +2904,13 @@ impl State {
         }
 
         if ButtonState::Pressed == button_state {
+            // A press outside a dismissable layer surface asks it to close. The press itself is
+            // handled as usual below.
+            let targets = self
+                .niri
+                .layers_to_dismiss_on_press(pointer.current_location());
+            self.request_layer_dismiss(targets, LayerDismissReason::Pointer);
+
             let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
             let modifiers = modifiers_from_state(mods);
 

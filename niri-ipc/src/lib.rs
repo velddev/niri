@@ -1754,6 +1754,32 @@ pub enum Event {
         /// Stream ID of the stopped screencast.
         stream_id: u64,
     },
+    /// A dismissable layer surface should close.
+    ///
+    /// Sent for layer surfaces matched by a layer rule with `dismissable true`, when the user
+    /// presses a mouse button outside of them, or presses Escape while keyboard focus is
+    /// elsewhere. niri doesn't close the surface: its client decides what to do.
+    ///
+    /// A pointer press is still delivered to whatever is under the pointer. An Escape press that
+    /// causes this event is not delivered to the focused surface.
+    LayerDismissRequested {
+        /// Namespace of the layer surface.
+        namespace: String,
+        /// Name of the output the layer surface is on.
+        output: String,
+        /// What the user did.
+        reason: LayerDismissReason,
+    },
+}
+
+/// Why a dismissable layer surface should close.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum LayerDismissReason {
+    /// A mouse button was pressed outside of the surface.
+    Pointer,
+    /// Escape was pressed while another surface had keyboard focus.
+    Escape,
 }
 
 impl From<Duration> for Timestamp {

@@ -17,8 +17,8 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Action, Event, KeyboardLayouts, LayerDismissReason, OutputConfigChanged, Overview, Reply,
+    Request, Response, Timestamp, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -965,6 +965,26 @@ impl State {
         let mut state = server.event_stream_state.borrow_mut();
 
         let event = Event::ConfigLoaded { failed };
+        state.apply(event.clone());
+        server.send_event(event);
+    }
+
+    pub fn ipc_layer_dismiss_requested(
+        &mut self,
+        namespace: String,
+        output: String,
+        reason: LayerDismissReason,
+    ) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+        let mut state = server.event_stream_state.borrow_mut();
+
+        let event = Event::LayerDismissRequested {
+            namespace,
+            output,
+            reason,
+        };
         state.apply(event.clone());
         server.send_event(event);
     }

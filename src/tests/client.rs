@@ -29,6 +29,7 @@ use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
@@ -231,6 +232,17 @@ impl Client {
 
     pub fn layer(&mut self, surface: &WlSurface) -> &mut LayerSurface {
         self.state.layer(surface)
+    }
+
+    /// Sets the surface's input region to the given rectangles (empty: click-through).
+    pub fn set_input_region(&mut self, surface: &WlSurface, rects: &[(i32, i32, i32, i32)]) {
+        let compositor = self.state.compositor.as_ref().unwrap();
+        let region = compositor.create_region(&self.qh, ());
+        for &(x, y, w, h) in rects {
+            region.add(x, y, w, h);
+        }
+        surface.set_input_region(Some(&region));
+        region.destroy();
     }
 
     pub fn output(&mut self, name: &str) -> WlOutput {
@@ -596,6 +608,19 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
         _state: &mut Self,
         _proxy: &ZwlrLayerShellV1,
         _event: <ZwlrLayerShellV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<WlRegion, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlRegion,
+        _event: <WlRegion as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,

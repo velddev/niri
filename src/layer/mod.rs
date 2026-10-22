@@ -4,6 +4,7 @@ use niri_config::{BackgroundEffect, BlockOutFrom, CornerRadius, ResolvedPopupsRu
 use smithay::desktop::LayerSurface;
 use smithay::wayland::shell::wlr_layer::Layer;
 
+pub mod dismiss;
 pub mod mapped;
 pub use mapped::MappedLayer;
 
@@ -33,6 +34,9 @@ pub struct ResolvedLayerRules {
 
     /// Rules for this layer surface's popups.
     pub popups: ResolvedPopupsRules,
+
+    /// Whether clicks outside and Escape should ask this surface to close (over IPC).
+    pub dismissable: bool,
 }
 
 impl ResolvedLayerRules {
@@ -74,6 +78,9 @@ impl ResolvedLayerRules {
             }
             if let Some(x) = rule.baba_is_float {
                 resolved.baba_is_float = x;
+            }
+            if let Some(x) = rule.dismissable {
+                resolved.dismissable = x;
             }
 
             resolved.shadow.merge_with(&rule.shadow);

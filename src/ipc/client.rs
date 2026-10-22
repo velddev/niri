@@ -507,6 +507,16 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                     Event::CastStopped { stream_id } => {
                         println!("Cast stopped: stream id {stream_id}");
                     }
+                    Event::LayerDismissRequested {
+                        namespace,
+                        output,
+                        reason,
+                    } => {
+                        println!(
+                            "Layer surface dismiss requested: {namespace:?} on {output} \
+                             ({reason:?})"
+                        );
+                    }
                 }
             }
         }

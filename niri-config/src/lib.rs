@@ -656,6 +656,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_dismissable_layer_rule() {
+        let config = do_parse(
+            r#"
+            layer-rule {
+                match namespace="^launcher$"
+                dismissable true
+            }
+            layer-rule {
+                dismissable false
+            }
+            "#,
+        );
+        assert_eq!(config.layer_rules[0].dismissable, Some(true));
+        assert_eq!(config.layer_rules[1].dismissable, Some(false));
+        assert_eq!(do_parse("layer-rule {}").layer_rules[0].dismissable, None);
+    }
+
+    #[test]
     fn parse() {
         let parsed = do_parse(
             r##"
@@ -1942,6 +1960,7 @@ mod tests {
                             saturation: None,
                         },
                     },
+                    dismissable: None,
                 },
             ],
             binds: Binds(
