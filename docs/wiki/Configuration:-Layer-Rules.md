@@ -114,6 +114,7 @@ These properties apply continuously to open layer-shell surfaces.
 
 You can block out surfaces from xdg-desktop-portal screencasts or all screen captures.
 They will be replaced with solid black rectangles.
+A surface no bigger than 1×1 logical pixel is left out instead (nothing is drawn for it): some clients keep a hidden pop-up mapped as a transparent pixel so it opens faster, and that would otherwise show as a black dot.
 
 This can be useful for notifications.
 

@@ -5,7 +5,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use smithay::wayland::compositor::{remove_pre_commit_hook, HookId};
-use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
+use smithay::wayland::shell::wlr_layer::{ExclusiveZone, KeyboardInteractivity, Layer};
 
 use super::ResolvedLayerRules;
 use crate::animation::Clock;
@@ -17,7 +17,7 @@ use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::xray::XrayPos;
-use crate::render_helpers::{background_effect, RenderCtx};
+use crate::render_helpers::{background_effect, RenderCtx, RenderTarget};
 use crate::utils::{baba_is_float_offset, round_logical_in_physical};
 
 #[derive(Debug)]
@@ -36,8 +36,20 @@ pub struct MappedLayer {
     /// Set in the pre-commit hook when the layer changes; consumed in the commit handler.
     recompute_rules_on_commit: bool,
 
+    /// Keyboard interactivity as of the last commit we handled.
+    ///
+    /// Used to notice a mapped surface switching from None to OnDemand.
+    keyboard_interactivity: KeyboardInteractivity,
+
     /// Buffer to draw instead of the surface when it should be blocked out.
     block_out_buffer: SolidColorBuffer,
+
+    /// Whether the surface is no bigger than 1×1 logical pixel.
+    ///
+    /// Such a surface is skipped instead of blocked out: it can't show anything worth hiding,
+    /// and clients keep surfaces mapped at 1×1 while idle (so they open without creating a new
+    /// surface), which would otherwise leave a black pixel in screencasts.
+    is_tiny: bool,
 
     /// The shadow around the surface.
     shadow: Shadow,
@@ -79,12 +91,16 @@ impl MappedLayer {
         shadow_config.on = false;
         shadow_config.merge_with(&rules.shadow);
 
+        let keyboard_interactivity = surface.cached_state().keyboard_interactivity;
+
         Self {
             surface,
             pre_commit_hook,
             rules,
             recompute_rules_on_commit: false,
+            keyboard_interactivity,
             block_out_buffer: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
+            is_tiny: false,
             view_size,
             scale,
             shadow: Shadow::new(shadow_config),
@@ -113,6 +129,8 @@ impl MappedLayer {
     }
 
     pub fn update_render_elements(&mut self, size: Size<f64, Logical>) {
+        self.is_tiny = size.w <= 1. && size.h <= 1.;
+
         // Round to physical pixels.
         let size = size
             .to_physical_precise_round(self.scale)
@@ -147,6 +165,22 @@ impl MappedLayer {
 
         self.rules = new_rules;
         true
+    }
+
+    /// Records the keyboard interactivity of the commit being handled.
+    ///
+    /// Returns whether the surface just switched from None to OnDemand, which should give it
+    /// on-demand focus like a newly mapped on-demand surface gets.
+    pub fn update_keyboard_interactivity(&mut self) -> bool {
+        let new = self.surface.cached_state().keyboard_interactivity;
+        let prev = std::mem::replace(&mut self.keyboard_interactivity, new);
+        prev == KeyboardInteractivity::None && new == KeyboardInteractivity::OnDemand
+    }
+
+    /// Whether rendering for this target draws nothing at all for the surface: it should be
+    /// blocked out, and it's too small to show anything (see `is_tiny`).
+    pub fn is_skipped_for(&self, target: RenderTarget) -> bool {
+        self.is_tiny && target.should_block_out(self.rules.block_out_from)
     }
 
     pub fn set_recompute_rules_on_commit(&mut self) {
@@ -200,6 +234,10 @@ impl MappedLayer {
         let xray_pos = xray_pos.offset(bob_offset);
 
         let surface = self.surface.wl_surface();
+
+        if self.is_skipped_for(ctx.target) {
+            return;
+        }
 
         let should_block_out = ctx.target.should_block_out(self.rules.block_out_from);
         if should_block_out {

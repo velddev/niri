@@ -114,6 +114,8 @@ impl State {
 
         if is_mapped(surface) {
             let was_unmapped = self.niri.unmapped_layer_surfaces.remove(surface);
+            // A mapped surface that switched its keyboard interactivity from None to OnDemand.
+            let mut became_on_demand = false;
 
             // Resolve rules for newly mapped layer surfaces.
             if was_unmapped {
@@ -146,6 +148,8 @@ impl State {
             } else {
                 // The surface remains mapped.
                 if let Some(mapped) = self.niri.mapped_layer_surfaces.get_mut(layer) {
+                    became_on_demand = mapped.update_keyboard_interactivity();
+
                     // Check if the layer changed.
                     if mapped.take_recompute_rules_on_commit() {
                         let config = self.niri.config.borrow();
@@ -172,9 +176,15 @@ impl State {
             //    update_keyboard_focus(), so we don't need to check for that here.
             //
             // https://github.com/niri-wm/niri/issues/641
+            //
+            // A surface that stays mapped and switches from None to OnDemand gets the same, so a
+            // client can keep a hidden pop-up mapped (no keyboard, no input region) and still have
+            // it take the keyboard when it opens, without the cost of a new surface. Only on that
+            // switch, not on every commit of an on-demand surface: a click elsewhere must keep the
+            // focus away.
             let on_demand = layer.cached_state().keyboard_interactivity
                 == wlr_layer::KeyboardInteractivity::OnDemand;
-            if was_unmapped && on_demand {
+            if (was_unmapped && on_demand) || became_on_demand {
                 // I guess it'd make sense to check that no higher-layer on-demand surface
                 // has focus, but Smithay's Layer doesn't implement Ord so this would be a
                 // little annoying.
