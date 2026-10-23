@@ -15,7 +15,7 @@ use smithay::wayland::compositor::{Blocker, BlockerState};
 /// Default time limit, after which the transaction completes.
 ///
 /// Serves to avoid hanging when a client fails to respond to a configure promptly.
-const TIME_LIMIT: Duration = Duration::from_millis(300);
+pub const TIME_LIMIT: Duration = Duration::from_millis(300);
 
 /// Transaction between Wayland clients.
 ///

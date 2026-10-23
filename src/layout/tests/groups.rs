@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use niri_config::animations::{Curve, EasingParams, Kind};
+
 use super::*;
 
 const GAPS: f64 = 10.;
@@ -1111,6 +1113,8 @@ fn group_ops() -> impl Strategy<Value = Vec<Op>> {
         2 => (proptest::option::of(1..=5usize), 1..=5usize, arbitrary_split_side())
             .prop_map(move |(id, target, side)| one(Op::SplitWindowBeside { id, target, side })),
         2 => (1..=5usize).prop_map(move |id| one(Op::Communicate(id))),
+        // Time passing, past the transaction deadline of held slots too.
+        2 => (0..400i32).prop_map(move |msec_delta| one(Op::AdvanceAnimations { msec_delta })),
         2 => drag,
         1 => resize,
         1 => (1..=5usize).prop_map(move |id| one(Op::FullscreenWindow(id))),
@@ -1131,11 +1135,14 @@ proptest! {
     fn random_group_operations_keep_invariants(
         ops in prop::collection::vec(group_ops(), 0..50),
         wide in any::<bool>(),
+        animated in any::<bool>(),
     ) {
         let mut all = vec![Op::AddOutput(1)];
         all.extend(ops.into_iter().flatten());
         all.push(Op::CompleteAnimations);
-        check_ops_with_options(options(if wide { 1. } else { 0.5 }), all);
+        let width = if wide { 1. } else { 0.5 };
+        let options = if animated { anim_options(width) } else { options(width) };
+        check_ops_with_options(options, all);
     }
 }
 
@@ -1213,4 +1220,229 @@ fn floating_and_tabbed_leave_groups_alone() {
     more(&mut layout, [Op::ToggleWindowFloating { id: Some(2) }]);
     assert!(shape(&layout).contains("{2}"), "{}", shape(&layout));
     assert!(shape(&layout).contains("[1 3]"), "{}", shape(&layout));
+}
+
+// -- Animations -------------------------------------------------------------------------------
+
+/// `options()` with animations on: window movement, window resize and the view all go linearly
+/// over 1 s, so the state mid-way is easy to tell.
+fn anim_options(default_width: f64) -> Options {
+    const LINEAR: Kind = Kind::Easing(EasingParams {
+        duration_ms: 1000,
+        curve: Curve::Linear,
+    });
+    let mut options = options(default_width);
+    options.animations.off = false;
+    options.animations.window_resize.anim.kind = LINEAR;
+    options.animations.window_movement.0.kind = LINEAR;
+    options.animations.horizontal_view_movement.0.kind = LINEAR;
+    options
+}
+
+fn run_animated(
+    options: Options,
+    width: f64,
+    ops: impl IntoIterator<Item = Op>,
+) -> Layout<TestWindow> {
+    WIDTH.with(|w| w.set(width));
+    let mut all: Vec<Op> = vec![Op::AddOutput(1)];
+    all.extend(with_widths(ops));
+    all.extend(settle());
+    check_ops_with_options(options, all)
+}
+
+/// Applies `ops` without letting the windows commit or the time pass.
+fn apply(layout: &mut Layout<TestWindow>, ops: impl IntoIterator<Item = Op>) {
+    check_ops_on_layout(layout, ops);
+}
+
+fn advance(layout: &mut Layout<TestWindow>, msec: i32) {
+    check_ops_on_layout(layout, [Op::AdvanceAnimations { msec_delta: msec }]);
+}
+
+fn commit(layout: &mut Layout<TestWindow>, ids: impl IntoIterator<Item = usize>) {
+    check_ops_on_layout(layout, ids.into_iter().map(Op::Communicate));
+}
+
+/// Tile rectangles as drawn now (animated position and size) by window id.
+fn drawn(layout: &Layout<TestWindow>) -> HashMap<usize, Rectangle<f64, Logical>> {
+    layout
+        .active_workspace()
+        .unwrap()
+        .tiles_with_render_positions()
+        .filter(|(_, _, visible)| *visible)
+        .map(|(tile, pos, _)| {
+            (
+                tile.window().0.id,
+                Rectangle::new(pos, tile.animated_tile_size()),
+            )
+        })
+        .collect()
+}
+
+fn bounds(rects: impl IntoIterator<Item = Rectangle<f64, Logical>>) -> Rectangle<f64, Logical> {
+    rects.into_iter().reduce(|a, b| a.merge(b)).unwrap()
+}
+
+fn assert_inside(r: Rectangle<f64, Logical>, area: Rectangle<f64, Logical>, what: &str) {
+    // Positions and sizes are rounded to physical pixels each.
+    let eps = 1.;
+    assert!(
+        r.loc.x >= area.loc.x - eps
+            && r.loc.y >= area.loc.y - eps
+            && right(r) <= right(area) + eps
+            && bottom(r) <= bottom(area) + eps,
+        "{what}: {r:?} sticks out of the group {area:?}"
+    );
+}
+
+/// The rotate in the stacked group of windows 1 and 2 (1 focused), from a settled state.
+fn stacked_pair_animated() -> Layout<TestWindow> {
+    let layout = run_animated(
+        anim_options(0.5),
+        0.5,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+        ],
+    );
+    assert_eq!(shape(&layout), "(1 2)");
+    layout
+}
+
+#[test]
+fn merge_moves_the_view_at_once() {
+    // A lone column is centred (as in Mike's config). After window 1 merges into window 2's
+    // column, the group is the only column, so the view must head for the centre right away,
+    // not once the windows commit (meanwhile the merged window moved without the view and its
+    // neighbour went past its place and back).
+    let mut options = anim_options(0.5);
+    options.layout.always_center_single_column = true;
+    let mut layout = run_animated(options, 0.5, [window(1), window(2), Op::FocusColumnFirst]);
+
+    apply(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "(1 2)");
+    let view = layout.active_workspace().unwrap().scrolling().view_offset();
+    assert!(view.is_animation_ongoing(), "the view doesn't move");
+    let target = view.target();
+
+    // The commits don't change where the view goes.
+    more(&mut layout, []);
+    let view = layout.active_workspace().unwrap().scrolling().view_offset();
+    assert_eq!(view.target(), target);
+    // Centred.
+    let r = rects(&layout);
+    let group = bounds([r[&1], r[&2]]);
+    // (Rounded to a physical pixel.)
+    assert!((group.loc.x - (1280. - group.size.w) / 2.).abs() <= 0.5);
+}
+
+#[test]
+fn rotate_holds_resizing_slots_until_their_commit() {
+    let mut layout = stacked_pair_animated();
+    let before = drawn(&layout);
+    let group = bounds(before.values().copied());
+
+    apply(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2]");
+    // Until the windows commit their new sizes, nothing moves: window 2 doesn't jump to its new
+    // slot at its old size, sticking out of the group.
+    advance(&mut layout, 100);
+    assert_eq!(drawn(&layout), before);
+
+    // Then each slot moves together with its resize, inside the group all the way.
+    commit(&mut layout, [1, 2]);
+    assert_eq!(drawn(&layout), before);
+    advance(&mut layout, 500);
+    let mid = drawn(&layout);
+    assert_ne!(
+        mid[&2].loc, before[&2].loc,
+        "window 2 doesn't move after its commit"
+    );
+    for _ in 0..6 {
+        for (id, r) in drawn(&layout) {
+            assert_inside(r, group, &format!("window {id}"));
+        }
+        advance(&mut layout, 100);
+    }
+    more(&mut layout, []);
+    assert_eq!(drawn(&layout), rects(&layout));
+    assert_eq!(bounds(rects(&layout).into_values()), group);
+}
+
+#[test]
+fn held_slot_moves_anyway_at_the_transaction_deadline() {
+    let mut layout = stacked_pair_animated();
+    let before = drawn(&layout);
+
+    apply(&mut layout, [Op::SplitWindow { id: None }]);
+    // The windows never commit. The layout keeps asking for frames, to notice the deadline.
+    assert!(layout.are_animations_ongoing(None));
+    advance(&mut layout, 250);
+    assert_eq!(drawn(&layout), before);
+
+    // Past the 300 ms of the configure's transaction, window 2 goes to its slot without waiting.
+    advance(&mut layout, 100);
+    advance(&mut layout, 500);
+    let mid = drawn(&layout)[&2];
+    assert_ne!(
+        mid.loc, before[&2].loc,
+        "window 2 still waits for its commit"
+    );
+    advance(&mut layout, 600);
+    let moved = drawn(&layout)[&2];
+    // At its old size until it commits.
+    assert_eq!(moved.size, before[&2].size);
+
+    // The late commit only resizes it.
+    more(&mut layout, []);
+    let r = rects(&layout)[&2];
+    assert_eq!(r.loc, moved.loc);
+    assert_ne!(r.size, before[&2].size);
+}
+
+#[test]
+fn rotating_back_before_the_commit_acts_at_once() {
+    let mut layout = stacked_pair_animated();
+    let before = drawn(&layout);
+
+    apply(&mut layout, [Op::SplitWindow { id: None }]);
+    advance(&mut layout, 20);
+    // A second Mod+S while the first waits for the windows: back to stacked from what is drawn
+    // (still the stacked layout), at once, with nothing left to wait for.
+    apply(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "(1 2)");
+    assert_eq!(drawn(&layout), before);
+    let ws = layout.active_workspace().unwrap();
+    for (tile, _, _) in ws.tiles_with_render_positions() {
+        assert_eq!(tile.render_offset(), Point::from((0., 0.)));
+    }
+    assert!(!layout.are_animations_ongoing(None));
+
+    // The commits of the sizes asked for last change nothing.
+    commit(&mut layout, [1, 2]);
+    advance(&mut layout, 500);
+    assert_eq!(drawn(&layout), before);
+}
+
+#[test]
+fn swapping_equal_slots_moves_at_once() {
+    let mut layout = stacked_pair_animated();
+    let before = drawn(&layout);
+    assert_eq!(before[&1].size, before[&2].size);
+
+    // The slots keep their sizes, so the windows don't wait for a commit.
+    apply(&mut layout, [Op::MoveWindowDown]);
+    assert_eq!(shape(&layout), "(2 1)");
+    advance(&mut layout, 500);
+    let mid = drawn(&layout);
+    let half = (before[&1].loc.y + before[&2].loc.y) / 2.;
+    assert!((mid[&1].loc.y - half).abs() <= 0.5, "{mid:?}");
+    assert!((mid[&2].loc.y - half).abs() <= 0.5, "{mid:?}");
+    advance(&mut layout, 500);
+    let r = drawn(&layout);
+    assert_eq!(r[&1], before[&2]);
+    assert_eq!(r[&2], before[&1]);
 }

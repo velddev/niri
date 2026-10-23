@@ -16,7 +16,10 @@ use super::monitor::InsertPosition;
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
-use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
+use super::{
+    ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile,
+    RESIZE_ANIMATION_THRESHOLD,
+};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::SizingMode;
@@ -24,7 +27,9 @@ use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
-use crate::utils::transaction::{Transaction, TransactionBlocker};
+use crate::utils::transaction::{
+    Transaction, TransactionBlocker, TIME_LIMIT as TRANSACTION_TIME_LIMIT,
+};
 use crate::utils::ResizeEdge;
 use crate::window::ResolvedWindowRules;
 
@@ -278,6 +283,40 @@ struct TileData {
     /// Target rectangle of the tile's slot relative to the column's tiles origin, if the column
     /// is a group. Moves with the tile, so a new layout knows where the tile was before.
     group_rect: Option<Rectangle<f64, Logical>>,
+
+    /// Set while the tile waits in a group for its window to commit a new size before it moves
+    /// to `group_rect` (see [`SlotMoves::InPlace`]).
+    group_hold: Option<SlotHold>,
+}
+
+/// A group tile held where it is drawn until its window commits the new size of its slot, so
+/// that its move to the slot runs together with its resize animation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SlotHold {
+    /// Where the tile is held, relative to the column's tiles origin.
+    loc: Point<f64, Logical>,
+    /// The tile's size when the hold began: the first commit that changes it ends the hold.
+    size: Size<f64, Logical>,
+    /// Unadjusted clock time at which the tile stops waiting and moves anyway (a hung or slow
+    /// client), the same time limit as the transaction of the configure.
+    deadline: Duration,
+}
+
+/// How the tiles of a split group go to their slots after the group's layout changed.
+#[derive(Debug, Clone, Copy)]
+enum SlotMoves {
+    /// They jump (an interactive resize follows the pointer).
+    Jump,
+    /// They move at once with this animation: the column moves in the strip too (a merge, a
+    /// pop-out), so they must move with it.
+    Now(niri_config::Animation),
+    /// The column stays where it is (rotate, share changes, inserting or removing a window
+    /// inside the group). Tiles whose slot keeps its size move at once with this animation.
+    /// Tiles whose slot changes size stay where they are drawn until their window commits the
+    /// new size, then move with the window-resize animation, together with their resize, like
+    /// the windows of a plain column. Moved at once this early, they'd go to the new place at
+    /// the old size and stick out of the group until the commit.
+    InPlace(niri_config::Animation),
 }
 
 /// Width of a column.
@@ -824,6 +863,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         );
     }
 
+    /// Activates column `idx` and moves the view to it, also when `idx` already is the active
+    /// index because the column there was replaced or changed in place (a window merged into the
+    /// group there, or the active column was removed and its neighbour took its index).
+    /// [`Self::activate_column()`] does nothing then, and the view would only follow the column
+    /// once a window commits its new size, while the columns around it already move.
+    fn activate_column_in_place(&mut self, idx: usize) {
+        if self.active_column_idx == idx {
+            self.animate_view_offset_to_column(None, idx, None);
+        } else {
+            self.activate_column(idx);
+        }
+    }
+
     fn activate_column_with_anim_config(&mut self, idx: usize, config: niri_config::Animation) {
         if self.active_column_idx == idx
             // During a DnD scroll, animate even when activating the same window, for DnD hold.
@@ -1090,11 +1142,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         let column = &self.columns[self.active_column_idx];
-        Some(self.remove_tile_by_idx(
+        Some(self.remove_tile_by_idx_with(
             self.active_column_idx,
             column.active_tile_idx,
             transaction,
             None,
+            true,
         ))
     }
 
@@ -1107,7 +1160,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let column = &self.columns[column_idx];
 
         let tile_idx = column.position(window).unwrap();
-        self.remove_tile_by_idx(column_idx, tile_idx, transaction, None)
+        self.remove_tile_by_idx_with(column_idx, tile_idx, transaction, None, true)
     }
 
     pub fn remove_tile_by_idx(
@@ -1116,6 +1169,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         tile_idx: usize,
         transaction: Transaction,
         anim_config: Option<niri_config::Animation>,
+    ) -> RemovedTile<W> {
+        self.remove_tile_by_idx_with(column_idx, tile_idx, transaction, anim_config, false)
+    }
+
+    /// Removes a tile. `leaves_strip`: the tile leaves this space (it closes, goes to another
+    /// workspace, floats, is dragged), so a group it was in stays where it is and relays out in
+    /// place (see [`SlotMoves::InPlace`]); otherwise it goes to another column here, which can
+    /// move the group's column too.
+    fn remove_tile_by_idx_with(
+        &mut self,
+        column_idx: usize,
+        tile_idx: usize,
+        transaction: Transaction,
+        anim_config: Option<niri_config::Animation>,
+        leaves_strip: bool,
     ) -> RemovedTile<W> {
         // If this is the only tile in the column, remove the whole column.
         if self.columns[column_idx].tiles.len() == 1 {
@@ -1130,7 +1198,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
 
         if self.columns[column_idx].group.is_some() {
-            return self.remove_group_tile(column_idx, tile_idx, transaction, anim_config);
+            return self.remove_group_tile(
+                column_idx,
+                tile_idx,
+                transaction,
+                anim_config,
+                leaves_strip,
+            );
         }
 
         let column = &mut self.columns[column_idx];
@@ -2133,6 +2207,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 let col = &mut self.columns[target_column_idx];
                 let idx = col.merge_tile(removed.tile, false);
                 self.data[target_column_idx].update(&self.columns[target_column_idx]);
+                self.activate_column_in_place(target_column_idx);
                 let new_pos = self.tile_strip_pos(target_column_idx, idx);
                 self.columns[target_column_idx].tiles[idx].animate_move_from(old_pos - new_pos);
             }
@@ -4359,7 +4434,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         if was_active {
             self.columns[target].activate_idx(idx);
-            self.activate_column(target);
+        }
+        if was_active || self.active_column_idx == target {
+            self.activate_column_in_place(target);
         }
 
         let new_pos = self.tile_strip_pos(target, idx);
@@ -4462,7 +4539,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.data[t_col].update(&self.columns[t_col]);
         if was_active {
             self.columns[t_col].activate_idx(idx);
-            self.activate_column(t_col);
+        }
+        if was_active || self.active_column_idx == t_col {
+            self.activate_column_in_place(t_col);
         }
         let new_pos = self.tile_strip_pos(t_col, idx);
         self.columns[t_col].tiles[idx].animate_move_from(old_pos - new_pos);
@@ -4474,6 +4553,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     fn exchange_tiles(&mut self, a: (usize, usize), b: (usize, usize)) {
         if a == b {
             return;
+        }
+        // The slots stay and the windows move: holds (which are the windows') end first.
+        let config = self.options.animations.window_movement.0;
+        for col_idx in [a.0, b.0] {
+            self.columns[col_idx].release_slot_holds(config);
         }
         let pos_a = self.tile_strip_pos(a.0, a.1);
         let pos_b = self.tile_strip_pos(b.0, b.1);
@@ -4542,12 +4626,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     /// Removes tile `tile_idx` from the group in column `column_idx` (which keeps other tiles).
+    /// `in_place`: the group's column stays where it is (see [`SlotMoves::InPlace`]).
     fn remove_group_tile(
         &mut self,
         column_idx: usize,
         tile_idx: usize,
         transaction: Transaction,
         anim_config: Option<niri_config::Animation>,
+        in_place: bool,
     ) -> RemovedTile<W> {
         let movement_config = anim_config.unwrap_or(self.options.animations.window_movement.0);
         let prev_width = self.data[column_idx].width;
@@ -4580,7 +4666,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         column.tiles[active].ensure_alpha_animates_to_1();
 
         if column.group.is_some() {
-            column.update_group_sizes(true, transaction, Some(movement_config));
+            let moves = if in_place {
+                SlotMoves::InPlace(movement_config)
+            } else {
+                SlotMoves::Now(movement_config)
+            };
+            column.update_group_sizes(true, transaction, moves);
         } else {
             column.update_tile_sizes_with_transaction(true, transaction);
         }
@@ -4705,6 +4796,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     ) -> Tile<W> {
         let col = &mut self.columns[col_idx];
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        // The hold belongs to the window leaving the slot.
+        col.release_slot_hold(tile_idx, self.options.animations.window_movement.0);
         tile.update_config(col.view_size, col.scale, col.options.clone());
         let old = std::mem::replace(&mut col.tiles[tile_idx], tile);
         col.data[tile_idx].update(&col.tiles[tile_idx]);
@@ -4712,7 +4805,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.data[col_idx].update(&self.columns[col_idx]);
         if activate {
             self.columns[col_idx].activate_idx(tile_idx);
-            self.activate_column(col_idx);
+            self.activate_column_in_place(col_idx);
         }
         old
     }
@@ -4755,7 +4848,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.data[col_idx].update(&self.columns[col_idx]);
         if activate {
             self.columns[col_idx].activate_idx(idx);
-            self.activate_column(col_idx);
+            self.activate_column_in_place(col_idx);
         }
     }
 
@@ -4774,7 +4867,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.data[col_idx].update(&self.columns[col_idx]);
         if activate {
             self.columns[col_idx].activate_idx(idx);
-            self.activate_column(col_idx);
+            self.activate_column_in_place(col_idx);
         }
         None
     }
@@ -4844,11 +4937,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             col.group = Some(tree);
             col.group_home = None;
             let path = col.group.as_ref().unwrap().path_of_tile(home.index);
-            let idx = col.group_add_tile_at_path(path, removed.tile);
+            let idx = col.group_add_tile_at_path(path, removed.tile, false);
             self.data[t].update(&self.columns[t]);
             if was_active {
                 self.columns[t].activate_idx(idx);
-                self.activate_column(t);
+                self.activate_column_in_place(t);
             }
             let new_pos = self.tile_strip_pos(t, idx);
             self.columns[t].tiles[idx].animate_move_from(old_pos - new_pos);
@@ -5156,6 +5249,7 @@ impl TileData {
             size: Size::default(),
             interactively_resizing_by_left_edge: false,
             group_rect: None,
+            group_hold: None,
         };
         rv.update(tile);
         rv
@@ -5341,6 +5435,22 @@ impl<W: LayoutElement> Column<W> {
             }
         }
 
+        // Tiles still held in a group when the transaction deadline passed (a slow or hung
+        // client) don't wait any longer: they move to their slots, and resize whenever their
+        // window commits.
+        if self.data.iter().any(|data| data.group_hold.is_some()) {
+            let now = self.clock.now_unadjusted();
+            let config = self.options.animations.window_resize.anim;
+            for idx in 0..self.tiles.len() {
+                if self.data[idx]
+                    .group_hold
+                    .is_some_and(|hold| hold.deadline <= now)
+                {
+                    self.release_slot_hold(idx, config);
+                }
+            }
+        }
+
         for tile in &mut self.tiles {
             tile.advance_animations();
         }
@@ -5352,6 +5462,8 @@ impl<W: LayoutElement> Column<W> {
         self.move_animation.is_some()
             || self.tab_indicator.are_animations_ongoing()
             || self.tiles.iter().any(Tile::are_animations_ongoing)
+            // Keep advancing for the deadline of held tiles.
+            || self.data.iter().any(|data| data.group_hold.is_some())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -5614,6 +5726,16 @@ impl<W: LayoutElement> Column<W> {
 
         // Tiles in a group sit in their slots and don't move with each other's sizes.
         if self.group.is_some() {
+            // A tile held for this commit moves to its slot now, in step with its resize (which
+            // just started in tile.update_window()), like the tiles below a resizing window in a
+            // plain column.
+            if let Some(hold) = self.data[tile_idx].group_hold {
+                let size = self.tiles[tile_idx].tile_size();
+                if size != hold.size {
+                    let config = self.options.animations.window_resize.anim;
+                    self.release_slot_hold(tile_idx, config);
+                }
+            }
             return;
         }
 
@@ -5698,8 +5820,12 @@ impl<W: LayoutElement> Column<W> {
 
     fn update_tile_sizes_with_transaction(&mut self, animate: bool, transaction: Transaction) {
         if self.group.is_some() {
-            let config = animate.then_some(self.options.animations.window_resize.anim);
-            self.update_group_sizes(animate, transaction, config);
+            let moves = if animate {
+                SlotMoves::Now(self.options.animations.window_resize.anim)
+            } else {
+                SlotMoves::Jump
+            };
+            self.update_group_sizes(animate, transaction, moves);
             return;
         }
 
@@ -6537,15 +6663,21 @@ impl<W: LayoutElement> Column<W> {
             size: Size::default(),
             interactively_resizing_by_left_edge: false,
             group_rect: None,
+            group_hold: None,
         };
         let data = data.chain(iter::once(dummy));
 
         data.map(move |data| {
             let mut pos = origin;
 
-            // In a group, tiles sit in their slots.
+            // In a group, tiles sit in their slots (or where they are held until their commit).
             if grouped {
-                return pos + data.group_rect.map_or_else(Point::default, |r| r.loc);
+                let loc = match (data.group_hold, data.group_rect) {
+                    (Some(hold), _) => hold.loc,
+                    (None, Some(rect)) => rect.loc,
+                    (None, None) => Point::default(),
+                };
+                return pos + loc;
             }
 
             if center {
@@ -6723,6 +6855,11 @@ impl<W: LayoutElement> Column<W> {
             data2.update(tile);
             assert_eq!(data, &data2, "tile data must be up to date");
 
+            if data.group_hold.is_some() {
+                assert!(self.group.is_some(), "only group tiles can be held");
+                assert!(data.group_rect.is_some(), "a held tile must have a slot");
+            }
+
             if matches!(data.height, WindowHeight::Fixed(_)) {
                 assert!(
                     !found_fixed,
@@ -6779,6 +6916,31 @@ impl<W: LayoutElement> Column<W> {
     }
 }
 
+/// Animates `tile` moving from `delta` away (plus wherever its move animations have it now).
+///
+/// With `restart`, the move starts over with `config` (instead of carrying on with the ongoing
+/// animation's), so it runs in step with a resize animation starting at the same time.
+fn animate_tile_move_from<W: LayoutElement>(
+    tile: &mut Tile<W>,
+    delta: Point<f64, Logical>,
+    config: niri_config::Animation,
+    restart: bool,
+) {
+    let delta = if restart {
+        let current = tile.render_offset();
+        tile.stop_move_animations();
+        delta + current - tile.render_offset()
+    } else {
+        delta
+    };
+    if delta.x != 0. {
+        tile.animate_move_x_from_with_config(delta.x, config);
+    }
+    if delta.y != 0. {
+        tile.animate_move_y_from_with_config(delta.y, config);
+    }
+}
+
 /// Split groups: the column side. See `docs/wiki/Development:-Split-Groups.md`.
 impl<W: LayoutElement> Column<W> {
     /// The split group this column is, if any.
@@ -6826,13 +6988,9 @@ impl<W: LayoutElement> Column<W> {
 
     /// Lays out the group and requests the tile sizes.
     ///
-    /// Tiles whose slot moved animate from their previous position with `move_config`.
-    fn update_group_sizes(
-        &mut self,
-        animate: bool,
-        transaction: Transaction,
-        move_config: Option<niri_config::Animation>,
-    ) {
+    /// Tiles whose slot moved go there as `moves` says. A tile whose slot didn't change is left
+    /// as it is (it may still be held from an earlier relayout).
+    fn update_group_sizes(&mut self, animate: bool, transaction: Transaction, moves: SlotMoves) {
         let gaps = self.options.layout.gaps;
         let mins = self.group_min_sizes();
         let width = if self.is_full_width || self.is_pending_maximized {
@@ -6848,14 +7006,35 @@ impl<W: LayoutElement> Column<W> {
         group.layout(Size::from((width.max(min.w).max(1.), height)), gaps, &mins);
         let rects = group.filled_rects();
 
+        let resize_config = self.options.animations.window_resize.anim;
+        let deadline = self.clock.now_unadjusted() + TRANSACTION_TIME_LIMIT;
         for ((tile, data), rect) in zip(zip(&mut self.tiles, &mut self.data), rects) {
-            if let (Some(old), Some(config)) = (data.group_rect, move_config) {
-                let delta = old.loc - rect.loc;
-                if delta.x != 0. {
-                    tile.animate_move_x_from_with_config(delta.x, config);
-                }
-                if delta.y != 0. {
-                    tile.animate_move_y_from_with_config(delta.y, config);
+            if let Some(old) = data.group_rect.filter(|old| *old != rect) {
+                // Where the layout has the tile now.
+                let shown = data.group_hold.map_or(old.loc, |hold| hold.loc);
+                // Compared with what the window has now: when a pending change is undone (a second
+                // rotate before the commit), the tile is where it belongs already.
+                let size = tile.tile_size();
+                let resizes = (rect.size.w - size.w).abs() > RESIZE_ANIMATION_THRESHOLD
+                    || (rect.size.h - size.h).abs() > RESIZE_ANIMATION_THRESHOLD;
+                match moves {
+                    SlotMoves::InPlace(_) if animate && resizes && shown != rect.loc => {
+                        data.group_hold = Some(SlotHold {
+                            loc: shown,
+                            size,
+                            deadline,
+                        });
+                    }
+                    SlotMoves::InPlace(config) | SlotMoves::Now(config) => {
+                        data.group_hold = None;
+                        animate_tile_move_from(tile, shown - rect.loc, config, false);
+                    }
+                    SlotMoves::Jump => {
+                        // A held tile still glides out of its hold rather than jump.
+                        if data.group_hold.take().is_some() {
+                            animate_tile_move_from(tile, shown - rect.loc, resize_config, false);
+                        }
+                    }
                 }
             }
             data.group_rect = Some(rect);
@@ -6863,10 +7042,35 @@ impl<W: LayoutElement> Column<W> {
         }
     }
 
-    /// Re-lays out after a change of the tree: slots that moved animate with window-movement.
+    /// Ends the hold of tile `idx`, if any: it moves from where it was held to its slot with
+    /// `config`, starting now.
+    fn release_slot_hold(&mut self, idx: usize, config: niri_config::Animation) {
+        let data = &mut self.data[idx];
+        let (Some(hold), Some(rect)) = (data.group_hold.take(), data.group_rect) else {
+            return;
+        };
+        animate_tile_move_from(&mut self.tiles[idx], hold.loc - rect.loc, config, true);
+    }
+
+    /// Ends every hold in the group: the tiles move to their slots at once with `config`.
+    fn release_slot_holds(&mut self, config: niri_config::Animation) {
+        for idx in 0..self.tiles.len() {
+            self.release_slot_hold(idx, config);
+        }
+    }
+
+    /// Re-lays out after a change of the tree, in place (see [`SlotMoves::InPlace`]): slots
+    /// that only move animate with window-movement.
     fn relayout_group(&mut self) {
         let config = self.options.animations.window_movement.0;
-        self.update_group_sizes(true, Transaction::new(), Some(config));
+        self.update_group_sizes(true, Transaction::new(), SlotMoves::InPlace(config));
+    }
+
+    /// Re-lays out after a change of the tree while the column moves too: every slot moves at
+    /// once with window-movement.
+    fn relayout_group_now(&mut self) {
+        let config = self.options.animations.window_movement.0;
+        self.update_group_sizes(true, Transaction::new(), SlotMoves::Now(config));
     }
 
     /// Turns a plain column into a group of `kind`, the tiles' current sizes becoming the shares.
@@ -6899,14 +7103,19 @@ impl<W: LayoutElement> Column<W> {
         for data in &mut self.data {
             data.height = WindowHeight::auto_1();
             data.group_rect = None;
+            data.group_hold = None;
         }
     }
 
     /// Inserts `tile` into the slot that `make_slot` adds to the tree; returns its tile index.
+    ///
+    /// `in_place`: the column stays where it is (a drop into the group), rather than moving in the
+    /// strip as the window comes from another column (see [`SlotMoves`]).
     fn group_add_tile(
         &mut self,
         make_slot: impl FnOnce(&mut Group) -> group::Path,
         mut tile: Tile<W>,
+        in_place: bool,
     ) -> usize {
         tile.update_config(self.view_size, self.scale, self.options.clone());
         let group = self.group.as_mut().unwrap();
@@ -6921,7 +7130,11 @@ impl<W: LayoutElement> Column<W> {
         if idx <= self.active_tile_idx && self.tiles.len() > 1 {
             self.active_tile_idx += 1;
         }
-        self.relayout_group();
+        if in_place {
+            self.relayout_group();
+        } else {
+            self.relayout_group_now();
+        }
         idx
     }
 
@@ -6943,7 +7156,7 @@ impl<W: LayoutElement> Column<W> {
             }
             self.make_group(SplitKind::Stacked);
         }
-        self.group_add_tile(|g| g.insert_at_group_side(side), tile)
+        self.group_add_tile(|g| g.insert_at_group_side(side), tile, false)
     }
 
     /// Makes a group of two from a single-tile column with `tile` on `side`.
@@ -6958,11 +7171,17 @@ impl<W: LayoutElement> Column<W> {
         self.group_home = None;
         self.group = Some(Group::new(kind, 2, None));
         let path = vec![if new_first { 0 } else { 1 }];
-        self.group_add_tile_at_path(path, tile)
+        self.group_add_tile_at_path(path, tile, false)
     }
 
-    /// Adds `tile` into the slot at `path`, which the tree already has as filled.
-    fn group_add_tile_at_path(&mut self, path: group::Path, mut tile: Tile<W>) -> usize {
+    /// Adds `tile` into the slot at `path`, which the tree already has as filled. `in_place` as in
+    /// [`Column::group_add_tile`].
+    fn group_add_tile_at_path(
+        &mut self,
+        path: group::Path,
+        mut tile: Tile<W>,
+        in_place: bool,
+    ) -> usize {
         tile.update_config(self.view_size, self.scale, self.options.clone());
         let group = self.group.as_ref().unwrap();
         let idx = group.tile_of_path(&path).unwrap();
@@ -6972,7 +7191,11 @@ impl<W: LayoutElement> Column<W> {
         if idx <= self.active_tile_idx && self.tiles.len() > 1 {
             self.active_tile_idx += 1;
         }
-        self.relayout_group();
+        if in_place {
+            self.relayout_group();
+        } else {
+            self.relayout_group_now();
+        }
         idx
     }
 
@@ -6985,13 +7208,13 @@ impl<W: LayoutElement> Column<W> {
             self.make_group(SplitKind::Stacked);
         }
         let path = self.group.as_ref().unwrap().path_of_tile(anchor);
-        self.group_add_tile(|g| g.insert_beside(&path, side), tile)
+        self.group_add_tile(|g| g.insert_beside(&path, side), tile, false)
     }
 
     /// Inserts `tile` at an edge target of this group. Returns the index.
     fn insert_tile_at_target(&mut self, target: &EdgeTarget, tile: Tile<W>) -> usize {
         let target = target.clone();
-        self.group_add_tile(move |g| g.insert_at(&target).unwrap(), tile)
+        self.group_add_tile(move |g| g.insert_at(&target).unwrap(), tile, true)
     }
 
     /// Removes tile `idx` from the group, leaving its slot vacant if `vacate`.
@@ -7034,7 +7257,7 @@ impl<W: LayoutElement> Column<W> {
     /// Puts `tile` into the vacant slot. Returns its index.
     fn fill_vacancy(&mut self, tile: Tile<W>) -> Option<usize> {
         let path = self.group.as_mut()?.fill_vacancy()?;
-        Some(self.group_add_tile_at_path(path, tile))
+        Some(self.group_add_tile_at_path(path, tile, true))
     }
 
     fn has_vacancy(&self) -> bool {
@@ -7147,7 +7370,7 @@ impl<W: LayoutElement> Column<W> {
         self.update_group_sizes(
             true,
             Transaction::new(),
-            Some(self.options.animations.window_resize.anim),
+            SlotMoves::InPlace(self.options.animations.window_resize.anim),
         );
         true
     }
@@ -7203,7 +7426,7 @@ impl<W: LayoutElement> Column<W> {
             self.update_group_sizes(
                 true,
                 Transaction::new(),
-                Some(self.options.animations.window_resize.anim),
+                SlotMoves::InPlace(self.options.animations.window_resize.anim),
             );
         }
     }
@@ -7276,7 +7499,7 @@ impl<W: LayoutElement> Column<W> {
         lens[before] = a;
         lens[before + 1] = pair - a;
         group.set_shares(split, &lens);
-        self.update_group_sizes(false, Transaction::new(), None);
+        self.update_group_sizes(false, Transaction::new(), SlotMoves::Jump);
     }
 
     /// The ColumnWidth that keeps a window popped out of tile `idx`'s slot at its width.
