@@ -181,7 +181,7 @@ use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland, ChangeTracked, ResizeEdge,
+    send_scale_transform, write_png_rgba8, xwayland, ChangeTracked, ResizeEdge, SlowDispatchGuard,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -844,18 +844,25 @@ impl State {
     pub fn refresh_and_flush_clients(&mut self) {
         let _span = tracy_client::span!("State::refresh_and_flush_clients");
 
-        self.refresh();
+        {
+            let _slow = SlowDispatchGuard::new("refresh");
+            self.refresh();
+        }
 
         // Advance animations to the current time (not target render time) before rendering outputs
         // in order to clear completed animations and render elements. Even if we're not rendering,
         // it's good to advance every now and then so the workspace clean-up and animations don't
         // build up (the 1 second frame callback timer will call this line).
-        self.niri.advance_animations();
+        {
+            let _slow = SlowDispatchGuard::new("advancing animations");
+            self.niri.advance_animations();
+        }
 
         self.niri.redraw_queued_outputs(&mut self.backend);
 
         {
             let _span = tracy_client::span!("flush_clients");
+            let _slow = SlowDispatchGuard::new("flushing clients");
             self.niri.display_handle.flush_clients().unwrap();
         }
 
@@ -2237,6 +2244,7 @@ impl State {
         to_screenshot: &async_channel::Sender<NiriToScreenshot>,
         msg: ScreenshotToNiri,
     ) {
+        let _slow = SlowDispatchGuard::new("D-Bus screenshot request");
         match msg {
             ScreenshotToNiri::TakeScreenshot { include_cursor } => {
                 self.handle_take_screenshot(to_screenshot, include_cursor);
@@ -2581,6 +2589,7 @@ impl Niri {
             let socket_name = socket_source.socket_name().to_os_string();
             event_loop
                 .insert_source(socket_source, move |client, _, state| {
+                    let _slow = SlowDispatchGuard::new("new Wayland client");
                     state.niri.insert_client(NewClient {
                         client,
                         restricted: false,
@@ -2605,6 +2614,7 @@ impl Niri {
         let display_source = Generic::new(display, Interest::READ, Mode::Level);
         event_loop
             .insert_source(display_source, |_, display, state| {
+                let _slow = SlowDispatchGuard::new("Wayland client requests");
                 // SAFETY: we don't drop the display.
                 unsafe {
                     display.get_mut().dispatch_clients(state).unwrap();
@@ -3855,7 +3865,9 @@ impl Niri {
         }) {
             trace!("redrawing output");
             let output = output.clone();
+            let start = Instant::now();
             self.redraw(backend, &output);
+            crate::utils::log_if_slow_dispatch("redraw of ", &output.name(), start);
         }
     }
 
@@ -5418,6 +5430,7 @@ impl Niri {
             .event_loop
             .insert_source(Timer::from_duration(delay), move |_, _, state| {
                 let niri = &mut state.niri;
+                let _slow = SlowDispatchGuard::new("unfocused frame callback timer");
                 if let Some(output_state) = niri.output_state.get_mut(&output) {
                     output_state.unfocused_fc_timer = None;
                     // Otherwise a redraw or a VBlank is coming, and frame callbacks with it.

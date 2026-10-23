@@ -48,6 +48,44 @@ pub mod xwayland;
 
 pub static IS_SYSTEMD_SERVICE: AtomicBool = AtomicBool::new(false);
 
+/// Event loop work that takes longer than this gets a debug log, to find what stalls the main loop
+/// (and makes libinput warn that it's lagging behind).
+pub const SLOW_DISPATCH: Duration = Duration::from_millis(16);
+
+/// Logs, at debug level with the `niri::slow_dispatch` target, how long the work between its
+/// creation and its drop took, when that's longer than [`SLOW_DISPATCH`].
+///
+/// Costs two clock reads; silence it with `RUST_LOG=...,niri::slow_dispatch=off`.
+#[must_use]
+pub struct SlowDispatchGuard {
+    what: &'static str,
+    start: std::time::Instant,
+}
+
+impl SlowDispatchGuard {
+    pub fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowDispatchGuard {
+    fn drop(&mut self) {
+        log_if_slow_dispatch(self.what, "", self.start);
+    }
+}
+
+/// Logs like [`SlowDispatchGuard`], with a detail such as an output name.
+pub fn log_if_slow_dispatch(what: &str, detail: &str, start: std::time::Instant) {
+    let elapsed = start.elapsed();
+    if elapsed >= SLOW_DISPATCH {
+        let ms = elapsed.as_secs_f64() * 1000.;
+        debug!(target: "niri::slow_dispatch", "{what}{detail} took {ms:.1} ms");
+    }
+}
+
 /// A value that counts its mutable accesses: a cheap, conservative "may have changed" signal.
 ///
 /// Every `&mut` access through `DerefMut` (including method calls that take `&mut self`)

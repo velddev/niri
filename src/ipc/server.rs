@@ -35,7 +35,7 @@ use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
 use crate::protocols::appmenu;
-use crate::utils::{version, with_toplevel_role};
+use crate::utils::{version, with_toplevel_role, SlowDispatchGuard};
 use crate::window::Mapped;
 
 // If an event stream client fails to read events fast enough that we accumulate more than this
@@ -91,6 +91,7 @@ impl IpcServer {
             let source = Generic::new(listener, Interest::READ, Mode::Level);
             event_loop
                 .insert_source(source, |_, socket, state| {
+                    let _slow = SlowDispatchGuard::new("new IPC client");
                     match socket.accept() {
                         Ok((stream, _)) => on_new_ipc_client(state, stream),
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
@@ -386,6 +387,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 
             let action = niri_config::Action::from(action);
             ctx.event_loop.insert_idle(move |state| {
+                let _slow = SlowDispatchGuard::new("IPC action");
                 // Make sure some logic like workspace clean-up has a chance to run before doing
                 // actions.
                 state.niri.advance_animations();

@@ -62,7 +62,10 @@ impl Screencasting {
             let (pw_to_niri, from_pipewire) = calloop::channel::channel();
             event_loop
                 .insert_source(from_pipewire, move |event, _, state| match event {
-                    calloop::channel::Event::Msg(msg) => state.on_pw_msg(msg),
+                    calloop::channel::Event::Msg(msg) => {
+                        let _slow = crate::utils::SlowDispatchGuard::new("PipeWire message");
+                        state.on_pw_msg(msg)
+                    }
                     calloop::channel::Event::Closed => (),
                 })
                 .unwrap();
@@ -390,6 +393,7 @@ impl State {
     }
 
     pub fn on_screen_cast_msg(&mut self, msg: ScreenCastToNiri) {
+        let _slow = crate::utils::SlowDispatchGuard::new("D-Bus screencast request");
         match msg {
             ScreenCastToNiri::StartCast {
                 session_id,
