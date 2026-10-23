@@ -586,10 +586,17 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                     pos,
                     size,
                     scale,
+                    group,
                 } = rect;
+                let group = group.map_or_else(String::new, |g| {
+                    format!(
+                        ", in split group {} ({} x {} at {}, {})",
+                        g.group_id, g.size.0, g.size.1, g.pos.0, g.pos.1
+                    )
+                });
                 println!(
                     "Window ID {window_id} on output \"{output}\", workspace ID {workspace_id}: \
-                     {} x {} at {}, {} (scale {scale})",
+                     {} x {} at {}, {} (scale {scale}){group}",
                     size.0, size.1, pos.0, pos.1
                 );
             }
@@ -757,6 +764,7 @@ fn print_window(window: &Window) {
         window_size,
         tile_pos_in_workspace_view,
         window_offset_in_tile,
+        ref group,
     } = window.layout;
 
     println!("  Layout:");
@@ -784,6 +792,39 @@ fn print_window(window: &Window) {
         fmt_rounded(window_offset_in_tile.0),
         fmt_rounded(window_offset_in_tile.1)
     );
+
+    if let Some(group) = group {
+        let path = group
+            .path
+            .iter()
+            .map(|step| {
+                let split = match step.split {
+                    niri_ipc::GroupSplit::SideBySide => "side by side",
+                    niri_ipc::GroupSplit::Stacked => "stacked",
+                };
+                format!(
+                    "{} {}/{} ({}%)",
+                    split,
+                    step.index + 1,
+                    step.count,
+                    fmt_rounded(step.share * 100.)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" > ");
+        println!(
+            "    Split group {}: slot {} of {}, {} x {} at {}, {} in {} x {}; {path}",
+            group.group_id,
+            group.slot,
+            group.slot_count,
+            fmt_rounded(group.size_in_group.0),
+            fmt_rounded(group.size_in_group.1),
+            fmt_rounded(group.pos_in_group.0),
+            fmt_rounded(group.pos_in_group.1),
+            fmt_rounded(group.group_size.0),
+            fmt_rounded(group.group_size.1),
+        );
+    }
 }
 
 fn print_cast(cast: &Cast) {

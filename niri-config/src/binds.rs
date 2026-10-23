@@ -202,6 +202,18 @@ pub enum Action {
     ConsumeOrExpelWindowRight,
     #[knuffel(skip)]
     ConsumeOrExpelWindowRightById(u64),
+    SplitWindow,
+    #[knuffel(skip)]
+    SplitWindowById(u64),
+    UnsplitWindow,
+    #[knuffel(skip)]
+    UnsplitWindowById(u64),
+    #[knuffel(skip)]
+    SplitWindowBeside {
+        id: Option<u64>,
+        target: u64,
+        side: niri_ipc::SplitSide,
+    },
     ConsumeWindowIntoColumn,
     ExpelWindowFromColumn,
     SwapWindowLeft,
@@ -493,6 +505,13 @@ impl From<niri_ipc::Action> for Action {
             }
             niri_ipc::Action::ConsumeOrExpelWindowRight { id: Some(id) } => {
                 Self::ConsumeOrExpelWindowRightById(id)
+            }
+            niri_ipc::Action::SplitWindow { id: None } => Self::SplitWindow,
+            niri_ipc::Action::SplitWindow { id: Some(id) } => Self::SplitWindowById(id),
+            niri_ipc::Action::UnsplitWindow { id: None } => Self::UnsplitWindow,
+            niri_ipc::Action::UnsplitWindow { id: Some(id) } => Self::UnsplitWindowById(id),
+            niri_ipc::Action::SplitWindowBeside { id, target, side } => {
+                Self::SplitWindowBeside { id, target, side }
             }
             niri_ipc::Action::ConsumeWindowIntoColumn {} => Self::ConsumeWindowIntoColumn,
             niri_ipc::Action::ExpelWindowFromColumn {} => Self::ExpelWindowFromColumn,

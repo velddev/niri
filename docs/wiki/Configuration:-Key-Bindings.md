@@ -419,3 +419,22 @@ binds {
     Super+Alt+L allow-inhibiting=false { spawn "swaylock"; }
 }
 ```
+
+#### `split-window`, `unsplit-window`
+
+`split-window` puts the focused window into a *split group*: a column whose windows sit side by side or stacked in a grid of slots.
+On a window alone in its column, it merges the window with the column to its right (at the end of the strip, the one to its left), taking half of that column's area along its longer side.
+On a window already in a group, it rotates the window's split between side by side and stacked.
+
+`unsplit-window` pops the focused window out of its group into its own column next to the group.
+
+A group is a column like any other: column widths, presets and moving the column act on the whole group, while window-level sizes (`set-window-width`, `set-window-height`, dragging the gap between two slots) change the sizes of its slots.
+Inside a group, focus and move actions go through the slots first.
+See [the design note](./Development:-Split-Groups.md) for all the details.
+
+```kdl
+binds {
+    Mod+S { split-window; }
+    Mod+Shift+S { unsplit-window; }
+}
+```

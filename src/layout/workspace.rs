@@ -18,8 +18,9 @@ use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
+use super::group::Side;
 use super::scrolling::{
-    Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
+    Column, ColumnWidth, MoveOrigin, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
 };
 use super::shadow::Shadow;
 use super::tile::{Tile, TileRenderSnapshot};
@@ -1096,6 +1097,127 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    /// Whether `window` (or the focused window) is in the scrolling layout.
+    fn targets_scrolling(&self, window: Option<&W::Id>) -> bool {
+        !window.map_or(self.floating_is_active.get(), |id| {
+            self.floating.has_window(id)
+        })
+    }
+
+    pub fn split_window(&mut self, window: Option<&W::Id>) {
+        if self.targets_scrolling(window) {
+            self.scrolling.split_window(window);
+        }
+    }
+
+    pub fn unsplit_window(&mut self, window: Option<&W::Id>) {
+        if self.targets_scrolling(window) {
+            self.scrolling.unsplit_window(window);
+        }
+    }
+
+    pub fn split_window_beside(&mut self, window: &W::Id, target: &W::Id, side: Side) -> bool {
+        if self.floating.has_window(window) || self.floating.has_window(target) {
+            return false;
+        }
+        let rv = self.scrolling.split_window_beside(window, target, side);
+        if rv {
+            self.floating_is_active = FloatingActive::No;
+        }
+        rv
+    }
+
+    /// Split groups with their rectangles in workspace view coordinates and their windows.
+    pub fn groups_with_render_rects(
+        &self,
+    ) -> impl Iterator<Item = (u64, Rectangle<f64, Logical>, Vec<&W>)> + '_ {
+        self.scrolling.groups_with_render_rects()
+    }
+
+    pub fn clear_vacancies(&mut self) {
+        self.scrolling.clear_vacancies();
+    }
+
+    pub fn has_vacancy(&self) -> bool {
+        self.scrolling.has_vacancy()
+    }
+
+    pub fn prepare_vacancy(&mut self, window: &W::Id) {
+        if !self.floating.has_window(window) {
+            self.scrolling.prepare_vacancy(window);
+        }
+    }
+
+    pub(super) fn move_origin(&self, window: &W::Id) -> Option<MoveOrigin<W::Id>> {
+        if self.floating.has_window(window) {
+            return None;
+        }
+        self.scrolling.move_origin(window)
+    }
+
+    /// Puts a window swapped out of a group at a dragged window's origin on this workspace.
+    pub(super) fn place_at_origin(
+        &mut self,
+        tile: Tile<W>,
+        origin: &MoveOrigin<W::Id>,
+    ) -> Option<Tile<W>> {
+        self.enter_output_for_window(tile.window());
+        self.scrolling.place_at_origin(tile, origin)
+    }
+
+    /// Drop onto a window in a group; returns the window that comes out.
+    pub fn swap_into_group(
+        &mut self,
+        col_idx: usize,
+        tile_idx: usize,
+        tile: Tile<W>,
+        activate: bool,
+    ) -> Tile<W> {
+        self.enter_output_for_window(tile.window());
+        let old = self
+            .scrolling
+            .swap_into_group(col_idx, tile_idx, tile, activate);
+        if let Some(output) = &self.output {
+            old.window().output_leave(output);
+        }
+        if activate {
+            self.floating_is_active = FloatingActive::No;
+        }
+        old
+    }
+
+    pub fn insert_into_group(
+        &mut self,
+        col_idx: usize,
+        slot: usize,
+        side: Side,
+        tile: Tile<W>,
+        activate: bool,
+    ) {
+        self.enter_output_for_window(tile.window());
+        self.scrolling
+            .insert_into_group(col_idx, slot, side, tile, activate);
+        if activate {
+            self.floating_is_active = FloatingActive::No;
+        }
+    }
+
+    pub fn fill_vacancy(
+        &mut self,
+        col_idx: usize,
+        tile: Tile<W>,
+        activate: bool,
+    ) -> Option<Tile<W>> {
+        self.enter_output_for_window(tile.window());
+        if let Some(tile) = self.scrolling.fill_vacancy(col_idx, tile, activate) {
+            return Some(tile);
+        }
+        if activate {
+            self.floating_is_active = FloatingActive::No;
+        }
+        None
+    }
+
     pub fn consume_or_expel_window_left(&mut self, window: Option<&W::Id>) {
         if window.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
@@ -1195,7 +1317,7 @@ impl<W: LayoutElement> Workspace<W> {
         if self.floating_is_active.get() {
             self.floating.set_window_width(None, change, true);
         } else {
-            self.scrolling.set_window_width(None, change);
+            self.scrolling.set_column_width(change);
         }
     }
 

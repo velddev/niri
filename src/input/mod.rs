@@ -1594,6 +1594,65 @@ impl State {
             Action::UnsetWorkSpaceNameByRef(reference) => {
                 self.niri.layout.unset_workspace_name(Some(reference));
             }
+            Action::SplitWindow => {
+                self.niri.layout.split_window(None);
+                self.maybe_warp_cursor_to_focus();
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
+            Action::SplitWindowById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.split_window(Some(&window));
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::UnsplitWindow => {
+                self.niri.layout.unsplit_window(None);
+                self.maybe_warp_cursor_to_focus();
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
+            Action::UnsplitWindowById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.unsplit_window(Some(&window));
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SplitWindowBeside { id, target, side } => {
+                let find = |id: u64| {
+                    self.niri
+                        .layout
+                        .windows()
+                        .find(|(_, m)| m.id().get() == id)
+                        .map(|(_, m)| m.window.clone())
+                };
+                let window = match id {
+                    Some(id) => find(id),
+                    None => self.niri.layout.focus().map(|m| m.window.clone()),
+                };
+                if let (Some(window), Some(target)) = (window, find(target)) {
+                    let side = match side {
+                        niri_ipc::SplitSide::Left => crate::layout::group::Side::Left,
+                        niri_ipc::SplitSide::Right => crate::layout::group::Side::Right,
+                        niri_ipc::SplitSide::Up => crate::layout::group::Side::Top,
+                        niri_ipc::SplitSide::Down => crate::layout::group::Side::Bottom,
+                    };
+                    self.niri
+                        .layout
+                        .split_window_beside(Some(&window), &target, side);
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
             Action::ConsumeWindowIntoColumn => {
                 self.niri.layout.consume_into_column();
                 // This does not cause immediate focus or window size change, so warping mouse to

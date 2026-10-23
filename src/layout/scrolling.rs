@@ -11,6 +11,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
+use super::group::{self, EdgeTarget, Group, Side, SplitKind};
 use super::monitor::InsertPosition;
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
@@ -92,6 +93,24 @@ pub struct ScrollingSpace<W: LayoutElement> {
 
     /// Configurable properties of the layout.
     options: Rc<Options>,
+
+    /// A window whose next removal from its group leaves its slot vacant: it's starting to be
+    /// dragged.
+    vacate_on_removal: Option<W::Id>,
+
+    /// What an ongoing interactive resize of a window in a group moves. Only valid while
+    /// `interactive_resize` is for the same window.
+    group_resize: Option<GroupResize<W>>,
+}
+
+/// An interactive resize of a window in a group: per axis, the crevice inside the group it moves
+/// (split, child before the crevice, original lengths), or for left/right the group's width.
+#[derive(Debug)]
+struct GroupResize<W: LayoutElement> {
+    window: W::Id,
+    x: Option<(group::Path, usize, Vec<f64>)>,
+    y: Option<(group::Path, usize, Vec<f64>)>,
+    width: f64,
 }
 
 niri_render_elements! {
@@ -214,6 +233,32 @@ pub struct Column<W: LayoutElement> {
 
     /// Configurable properties of the layout.
     options: Rc<Options>,
+
+    /// The split group this column is, if any.
+    ///
+    /// A group lays its tiles out in the slots of a tree instead of stacking them. Filled slot `i`
+    /// (depth-first) holds `tiles[i]`. A group column is always in the normal display mode and
+    /// never fullscreen or maximized. See `docs/wiki/Development:-Split-Groups.md`.
+    group: Option<Group>,
+
+    /// Where this column's window came from, if it left a group to go fullscreen or maximized.
+    ///
+    /// When it goes back to normal, it returns into its slot.
+    group_home: Option<GroupHome<W>>,
+}
+
+/// A window's place in a group, kept while it is fullscreen or maximized on its own.
+#[derive(Debug)]
+struct GroupHome<W: LayoutElement> {
+    /// The group's tree before the window left (the window's slot included).
+    tree: Group,
+    /// Windows of the group's slots in order, the leaving window included.
+    windows: Vec<W::Id>,
+    /// Tile index of the leaving window.
+    index: usize,
+    /// A neighbouring window and the side of it the window was on, to go back next to it if the
+    /// group changed in the meantime.
+    anchor: Option<(W::Id, Side)>,
 }
 
 /// Extra per-tile data.
@@ -229,6 +274,10 @@ struct TileData {
 
     /// Cached whether the tile is being interactively resized by its left edge.
     interactively_resizing_by_left_edge: bool,
+
+    /// Target rectangle of the tile's slot relative to the column's tiles origin, if the column
+    /// is a group. Moves with the tile, so a new layout knows where the tile was before.
+    group_rect: Option<Rectangle<f64, Logical>>,
 }
 
 /// Width of a column.
@@ -297,6 +346,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             data: Vec::new(),
             active_column_idx: 0,
             interactive_resize: None,
+            vacate_on_removal: None,
+            group_resize: None,
             view_offset: ViewOffset::Static(0.),
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
@@ -834,6 +885,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return InsertPosition::NewColumn(closest_col_idx);
         }
 
+        // Groups have their own drop targets: crevices, windows to swap with, their outer edges.
+        if self.columns[col_idx].group.is_some() {
+            let pos = Point::from((pos.x + self.view_pos(), pos.y));
+            return self.group_insert_position(col_idx, pos);
+        }
+
         // Find the closest gap between tiles.
         let col = &self.columns[col_idx];
 
@@ -899,11 +956,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let target_column = &mut self.columns[col_idx];
         let tile_idx = tile_idx.unwrap_or(target_column.tiles.len());
         let mut prev_active_tile_idx = target_column.active_tile_idx;
+        let is_group = target_column.group.is_some();
 
-        target_column.add_tile_at(tile_idx, tile);
+        let tile_idx = target_column.add_tile_at(tile_idx, tile);
         self.data[col_idx].update(target_column);
 
-        if tile_idx <= prev_active_tile_idx {
+        if is_group {
+            // The group keeps its active tile index up to date itself.
+            prev_active_tile_idx = target_column.active_tile_idx;
+        } else if tile_idx <= prev_active_tile_idx {
             target_column.active_tile_idx += 1;
             prev_active_tile_idx += 1;
         }
@@ -1059,12 +1120,17 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // If this is the only tile in the column, remove the whole column.
         if self.columns[column_idx].tiles.len() == 1 {
             let mut column = self.remove_column_by_idx(column_idx, anim_config);
+            let (width, is_full_width) = column.width_for_slot(tile_idx);
             return RemovedTile {
                 tile: column.tiles.remove(tile_idx),
-                width: column.width,
-                is_full_width: column.is_full_width,
+                width,
+                is_full_width,
                 is_floating: false,
             };
+        }
+
+        if self.columns[column_idx].group.is_some() {
+            return self.remove_group_tile(column_idx, tile_idx, transaction, anim_config);
         }
 
         let column = &mut self.columns[column_idx];
@@ -1274,6 +1340,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         column.update_window(window);
         self.data[col_idx].update(column);
         column.update_tile_sizes(false);
+        if column.group.is_some() {
+            // A min size change can change the group's width.
+            self.data[col_idx].update(column);
+        }
 
         let offset = prev_width - self.data[col_idx].width;
 
@@ -1487,6 +1557,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if col_idx < self.active_column_idx {
             let offset = if removing_last {
                 self.column_x(col_idx + 1) - self.column_x(col_idx)
+            } else if col.group.is_some() {
+                // A group keeps its width.
+                0.
             } else {
                 self.data[col_idx].width
                     - col
@@ -1549,20 +1622,49 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     pub fn focus_left(&mut self) -> bool {
+        // In a group, go through its slots first.
+        if let Some(col) = self.columns.get_mut(self.active_column_idx) {
+            if col.group.is_some() && col.group_focus(Side::Left) {
+                return true;
+            }
+        }
+
         if self.active_column_idx == 0 {
             return false;
         }
+        let at = self.active_tile_center_y();
         self.activate_column(self.active_column_idx - 1);
+        if let Some(at) = at {
+            self.columns[self.active_column_idx].activate_group_entry(Side::Right, at);
+        }
         true
     }
 
     pub fn focus_right(&mut self) -> bool {
+        // In a group, go through its slots first.
+        if let Some(col) = self.columns.get_mut(self.active_column_idx) {
+            if col.group.is_some() && col.group_focus(Side::Right) {
+                return true;
+            }
+        }
+
         if self.active_column_idx + 1 >= self.columns.len() {
             return false;
         }
 
+        let at = self.active_tile_center_y();
         self.activate_column(self.active_column_idx + 1);
+        if let Some(at) = at {
+            self.columns[self.active_column_idx].activate_group_entry(Side::Left, at);
+        }
         true
+    }
+
+    /// Vertical centre of the active tile in column coordinates, for entering a group.
+    fn active_tile_center_y(&self) -> Option<f64> {
+        let col = self.columns.get(self.active_column_idx)?;
+        let y = col.tile_offset(col.active_tile_idx).y;
+        Some(y + col.data[col.active_tile_idx].size.h / 2.)
     }
 
     pub fn focus_column_first(&mut self) {
@@ -1751,7 +1853,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return false;
         }
 
-        self.columns[self.active_column_idx].move_down()
+        let col_idx = self.active_column_idx;
+        let rv = self.columns[col_idx].move_down();
+        // In a group, swapping slots can change its minimum width.
+        self.data[col_idx].update(&self.columns[col_idx]);
+        rv
     }
 
     pub fn move_up(&mut self) -> bool {
@@ -1759,7 +1865,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return false;
         }
 
-        self.columns[self.active_column_idx].move_up()
+        let col_idx = self.active_column_idx;
+        let rv = self.columns[col_idx].move_up();
+        // In a group, swapping slots can change its minimum width.
+        self.data[col_idx].update(&self.columns[col_idx]);
+        rv
     }
 
     pub fn consume_or_expel_window_left(&mut self, window: Option<&W::Id>) {
@@ -1783,6 +1893,23 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             let source_tile_idx = self.columns[self.active_column_idx].active_tile_idx;
             (source_col_idx, source_tile_idx)
         };
+
+        // In a group: swap with the slot on the left, or leave the group at its left edge.
+        if self.columns[source_col_idx].group.is_some() {
+            self.group_move_tile(source_col_idx, source_tile_idx, Side::Left);
+            return;
+        }
+        // From a lone column into a group on the left: merge by the split rule.
+        if self.columns[source_col_idx].tiles.len() == 1
+            && source_col_idx > 0
+            && self.columns[source_col_idx - 1].group.is_some()
+        {
+            let source = &self.columns[source_col_idx];
+            if source.pending_sizing_mode().is_normal() && source.sizing_mode().is_normal() {
+                self.merge_column_into(source_col_idx, source_col_idx - 1);
+            }
+            return;
+        }
 
         let source_column = &self.columns[source_col_idx];
         let prev_off = source_column.tile_offset(source_tile_idx);
@@ -1892,6 +2019,23 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             (source_col_idx, source_tile_idx)
         };
 
+        // In a group: swap with the slot on the right, or leave the group at its right edge.
+        if self.columns[source_col_idx].group.is_some() {
+            self.group_move_tile(source_col_idx, source_tile_idx, Side::Right);
+            return;
+        }
+        // From a lone column into a group on the right: merge by the split rule.
+        if self.columns[source_col_idx].tiles.len() == 1
+            && source_col_idx + 1 < self.columns.len()
+            && self.columns[source_col_idx + 1].group.is_some()
+        {
+            let source = &self.columns[source_col_idx];
+            if source.pending_sizing_mode().is_normal() && source.sizing_mode().is_normal() {
+                self.merge_column_into(source_col_idx, source_col_idx + 1);
+            }
+            return;
+        }
+
         let cur_x = self.column_x(source_col_idx);
 
         let source_column = &self.columns[source_col_idx];
@@ -1974,6 +2118,27 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let target_column_idx = self.active_column_idx;
         let source_column_idx = self.active_column_idx + 1;
 
+        // Into a group: the window merges by the split rule (from the right).
+        if self.columns[target_column_idx].group.is_some() {
+            let source = &self.columns[source_column_idx];
+            if !source.pending_sizing_mode().is_normal() || !source.sizing_mode().is_normal() {
+                return;
+            }
+            if source.tiles.len() == 1 {
+                self.merge_column_into(source_column_idx, target_column_idx);
+            } else {
+                let old_pos = self.tile_strip_pos(source_column_idx, 0);
+                let removed =
+                    self.remove_tile_by_idx(source_column_idx, 0, Transaction::new(), None);
+                let col = &mut self.columns[target_column_idx];
+                let idx = col.merge_tile(removed.tile, false);
+                self.data[target_column_idx].update(&self.columns[target_column_idx]);
+                let new_pos = self.tile_strip_pos(target_column_idx, idx);
+                self.columns[target_column_idx].tiles[idx].animate_move_from(old_pos - new_pos);
+            }
+            return;
+        }
+
         let offset = self.column_x(source_column_idx)
             + self.columns[source_column_idx].render_offset().x
             - self.column_x(target_column_idx);
@@ -2054,6 +2219,45 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             ScrollDirection::Left => -1,
             ScrollDirection::Right => 1,
         });
+
+        // Groups swap windows in place: with the neighbouring slot, or at the group's edge with
+        // the neighbouring column's window.
+        if self.columns[source_column_idx].group.is_some()
+            || self.columns[target_column_idx].group.is_some()
+        {
+            let source_tile_idx = self.columns[source_column_idx].active_tile_idx;
+            let side = match direction {
+                ScrollDirection::Left => Side::Left,
+                ScrollDirection::Right => Side::Right,
+            };
+            let col = &self.columns[source_column_idx];
+            if col.group.is_some() {
+                if let Some(other) = col.group_neighbor(source_tile_idx, side) {
+                    self.exchange_tiles(
+                        (source_column_idx, source_tile_idx),
+                        (source_column_idx, other),
+                    );
+                    self.columns[source_column_idx].activate_idx(other);
+                    return;
+                }
+            }
+            let target = &self.columns[target_column_idx];
+            if target.display_mode == ColumnDisplay::Tabbed
+                || !target.pending_sizing_mode().is_normal()
+                || !self.columns[source_column_idx]
+                    .pending_sizing_mode()
+                    .is_normal()
+            {
+                return;
+            }
+            let target_tile_idx = target.active_tile_idx;
+            self.exchange_tiles(
+                (source_column_idx, source_tile_idx),
+                (target_column_idx, target_tile_idx),
+            );
+            self.activate_column(target_column_idx);
+            return;
+        }
 
         // if both source and target columns contain a single tile, then the operation is equivalent
         // to a simple column move
@@ -2178,6 +2382,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let col = &mut self.columns[self.active_column_idx];
         if col.display_mode == display {
+            return;
+        }
+
+        // Groups are never tabbed.
+        if col.group.is_some() {
             return;
         }
 
@@ -2426,6 +2635,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     let layout = WindowLayout {
                         // Our indices are 1-based, consistent with the actions.
                         pos_in_scrolling_layout: Some((col_idx + 1, tile_idx + 1)),
+                        group: col.ipc_group(tile_idx),
                         ..tile.ipc_layout_template()
                     };
                     (tile, layout)
@@ -2517,6 +2727,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 Rectangle::new(loc, size)
             }
             InsertPosition::Floating => return None,
+            InsertPosition::GroupEdge(..)
+            | InsertPosition::GroupSwap(..)
+            | InsertPosition::GroupVacancy(..) => self.group_hint_area(position)?,
         };
 
         // First window on an empty workspace will cancel out any view offset. Replicate this
@@ -2587,10 +2800,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        let prev_width = self.data[self.active_column_idx].width;
         let col = &mut self.columns[self.active_column_idx];
         col.toggle_width(None, forwards);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.animate_group_width_change(self.active_column_idx, prev_width);
     }
 
     pub fn toggle_full_width(&mut self) {
@@ -2598,14 +2813,53 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        let prev_width = self.data[self.active_column_idx].width;
         let col = &mut self.columns[self.active_column_idx];
         col.toggle_full_width();
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.animate_group_width_change(self.active_column_idx, prev_width);
+    }
+
+    /// Sets the active column's width (for a group: the whole group's).
+    pub fn set_column_width(&mut self, change: SizeChange) {
+        if self.columns.is_empty() {
+            return;
+        }
+
+        let col_idx = self.active_column_idx;
+        if self.columns[col_idx].group.is_none() {
+            self.set_window_width(None, change);
+            return;
+        }
+
+        let prev_width = self.data[col_idx].width;
+        let col = &mut self.columns[col_idx];
+        col.set_column_width(change, None, true);
+        cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.animate_group_width_change(col_idx, prev_width);
+    }
+
+    /// The column and tile of `window` (or the active one) if it's in a group.
+    fn group_tile(&self, window: Option<&W::Id>) -> Option<(usize, usize)> {
+        let (col_idx, tile_idx) = self.find_tile(window)?;
+        self.columns[col_idx]
+            .group
+            .is_some()
+            .then_some((col_idx, tile_idx))
     }
 
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
         if self.columns.is_empty() {
+            return;
+        }
+
+        // Inside a group, window sizes are the group's internal sizing.
+        if let Some((col_idx, tile_idx)) = self.group_tile(window) {
+            let col = &mut self.columns[col_idx];
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            col.group_change_len(tile_idx, SplitKind::SideBySide, change);
+            self.data[col_idx].update(&self.columns[col_idx]);
             return;
         }
 
@@ -2633,6 +2887,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        if let Some((col_idx, tile_idx)) = self.group_tile(window) {
+            let col = &mut self.columns[col_idx];
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            col.group_change_len(tile_idx, SplitKind::Stacked, change);
+            self.data[col_idx].update(&self.columns[col_idx]);
+            return;
+        }
+
         let (col, tile_idx) = if let Some(window) = window {
             self.columns
                 .iter_mut()
@@ -2654,6 +2916,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
     pub fn reset_window_height(&mut self, window: Option<&W::Id>) {
         if self.columns.is_empty() {
+            return;
+        }
+
+        if let Some((col_idx, tile_idx)) = self.group_tile(window) {
+            let col = &mut self.columns[col_idx];
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            col.group_equalize(tile_idx, SplitKind::Stacked);
+            self.data[col_idx].update(&self.columns[col_idx]);
             return;
         }
 
@@ -2681,6 +2951,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
+        if let Some((col_idx, tile_idx)) = self.group_tile(window) {
+            let col = &mut self.columns[col_idx];
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            col.group_toggle_len(tile_idx, SplitKind::SideBySide, forwards);
+            self.data[col_idx].update(&self.columns[col_idx]);
+            return;
+        }
+
         let (col, tile_idx) = if let Some(window) = window {
             self.columns
                 .iter_mut()
@@ -2702,6 +2980,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
     pub fn toggle_window_height(&mut self, window: Option<&W::Id>, forwards: bool) {
         if self.columns.is_empty() {
+            return;
+        }
+
+        if let Some((col_idx, tile_idx)) = self.group_tile(window) {
+            let col = &mut self.columns[col_idx];
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            col.group_toggle_len(tile_idx, SplitKind::Stacked, forwards);
+            self.data[col_idx].update(&self.columns[col_idx]);
             return;
         }
 
@@ -2740,9 +3026,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // logic here that computes the width in such a way so as to leave nearby columns fully
             // on screen while taking into account that the active column will remain centered
             // after resizing. But I'm not sure it's that useful? So let's do the simple thing.
+            let prev_width = self.data[self.active_column_idx].width;
             let col = &mut self.columns[self.active_column_idx];
             col.toggle_full_width();
             cancel_resize_for_column(&mut self.interactive_resize, col);
+            self.animate_group_width_change(self.active_column_idx, prev_width);
             return;
         }
 
@@ -2804,7 +3092,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // Only the active column was fully on-screen (maybe it's the only column), so we're
             // about to set its width to 100% of the working area. Let's do it via
             // toggle_full_width() as it lets you back out of it more intuitively.
+            let prev_width = self.data[self.active_column_idx].width;
             col.toggle_full_width();
+            self.animate_group_width_change(self.active_column_idx, prev_width);
             return;
         }
 
@@ -2813,6 +3103,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         col.preset_width_idx = None;
         col.is_full_width = false;
         col.update_tile_sizes(true);
+        self.animate_group_width_change(self.active_column_idx, active_width);
 
         // Put the leftmost window into the view.
         let new_view_x = leftmost_col_x.unwrap() - gap - working_x;
@@ -2837,7 +3128,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
 
-        if is_fullscreen && (col.tiles.len() > 1 && !is_tabbed) {
+        if is_fullscreen && col.group.is_some() {
+            // In a group: the window goes fullscreen on its own, next to the group, and comes
+            // back into its slot afterwards.
+            let tile_idx = col.position(window).unwrap();
+            let home = col.group_home_for(tile_idx);
+            col_idx = self.pop_out_of_group(col_idx, tile_idx, ScrollDirection::Right);
+            col = &mut self.columns[col_idx];
+            col.group_home = home;
+        } else if is_fullscreen && (col.tiles.len() > 1 && !is_tabbed) {
             // This wasn't the only window in its column; extract it into a separate column.
             self.consume_or_expel_window_right(Some(window));
             col_idx += 1;
@@ -2848,6 +3147,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+
+        if !is_fullscreen && col.group_home.is_some() && col.pending_sizing_mode().is_normal() {
+            self.return_home(col_idx);
+        }
 
         true
     }
@@ -2868,7 +3171,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
 
-        if maximize && (col.tiles.len() > 1 && !is_tabbed) {
+        if maximize && col.group.is_some() {
+            // Like fullscreen: on its own, and back into its slot afterwards.
+            let tile_idx = col.position(window).unwrap();
+            let home = col.group_home_for(tile_idx);
+            col_idx = self.pop_out_of_group(col_idx, tile_idx, ScrollDirection::Right);
+            col = &mut self.columns[col_idx];
+            col.group_home = home;
+        } else if maximize && (col.tiles.len() > 1 && !is_tabbed) {
             // This wasn't the only window in its column; extract it into a separate column.
             self.consume_or_expel_window_right(Some(window));
             col_idx += 1;
@@ -2879,6 +3189,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+
+        if !maximize && col.group_home.is_some() && col.pending_sizing_mode().is_normal() {
+            self.return_home(col_idx);
+        }
 
         true
     }
@@ -3038,7 +3352,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                         let pos = pos.to_physical_precise_round(scale).to_logical(scale);
 
                         let mut edges = ResizeEdge::LEFT_RIGHT;
-                        if stacked {
+                        if col.group.is_some() {
+                            // In a group, top and bottom only where there's a crevice to move.
+                            if col.group_crevice(idx, Side::Top).is_some() {
+                                edges |= ResizeEdge::TOP;
+                            }
+                            if col.group_crevice(idx, Side::Bottom).is_some() {
+                                edges |= ResizeEdge::BOTTOM;
+                            }
+                        } else if stacked {
                             edges |= ResizeEdge::BOTTOM;
                             if idx > 0 {
                                 edges |= ResizeEdge::TOP;
@@ -3577,6 +3899,39 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let original_window_size = tile.window_size();
 
+        // In a group, an edge inside the group moves that crevice; the outer left and right edges
+        // resize the whole group.
+        self.group_resize = None;
+        if col.group.is_some() {
+            let tile_idx = col.position(&window).unwrap();
+            let crevice = |side| {
+                col.group_crevice(tile_idx, side).map(|(split, before)| {
+                    let lens = col.group.as_ref().unwrap().child_lens(&split);
+                    (split, before, lens)
+                })
+            };
+            let x = if edges.contains(ResizeEdge::LEFT) {
+                crevice(Side::Left)
+            } else if edges.contains(ResizeEdge::RIGHT) {
+                crevice(Side::Right)
+            } else {
+                None
+            };
+            let y = if edges.contains(ResizeEdge::TOP) {
+                crevice(Side::Top)
+            } else if edges.contains(ResizeEdge::BOTTOM) {
+                crevice(Side::Bottom)
+            } else {
+                None
+            };
+            self.group_resize = Some(GroupResize {
+                window: window.clone(),
+                x,
+                y,
+                width: col.width(),
+            });
+        }
+
         let resize = InteractiveResize {
             window,
             original_window_size,
@@ -3604,17 +3959,67 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let is_centering = self.is_centering_focused_column();
 
-        let col = self
+        let col_idx = self
             .columns
-            .iter_mut()
-            .find(|col| col.contains(window))
+            .iter()
+            .position(|col| col.contains(window))
             .unwrap();
+        let col = &mut self.columns[col_idx];
 
         let tile_idx = col
             .tiles
             .iter()
             .position(|tile| tile.window().id() == window)
             .unwrap();
+
+        if col.group.is_some() {
+            let edges = resize.data.edges;
+            let Some(gr) = self.group_resize.as_ref().filter(|g| &g.window == window) else {
+                return true;
+            };
+            if edges.intersects(ResizeEdge::LEFT_RIGHT) {
+                if let Some((split, before, orig)) = &gr.x {
+                    col.group_move_crevice(split, *before, orig, delta.x);
+                } else {
+                    let mut dx = delta.x;
+                    if edges.contains(ResizeEdge::LEFT) {
+                        dx = -dx;
+                    }
+                    if is_centering {
+                        dx *= 2.;
+                    }
+                    let prev_width = self.data[col_idx].width;
+                    let width = (gr.width + dx).round().max(1.) as i32;
+                    col.set_column_width(SizeChange::SetFixed(width), None, false);
+                    self.data[col_idx].update(col);
+                    let new_width = self.data[col_idx].width;
+
+                    // Keep the right edge in place when resizing by the left edge, like
+                    // update_window() does for plain columns when they commit.
+                    if col_idx == self.active_column_idx && new_width != prev_width {
+                        self.view_offset.cancel_gesture();
+                        let offset = if is_centering {
+                            let new_offset = -(self.working_area.size.w - new_width) / 2.
+                                - self.working_area.loc.x;
+                            new_offset - self.view_offset.target()
+                        } else if edges.contains(ResizeEdge::LEFT) {
+                            new_width - prev_width
+                        } else {
+                            0.
+                        };
+                        self.view_offset.offset(offset);
+                    }
+                }
+            }
+            if edges.intersects(ResizeEdge::TOP_BOTTOM) {
+                if let Some((split, before, orig)) = &gr.y {
+                    let col = &mut self.columns[col_idx];
+                    col.group_move_crevice(split, *before, orig, delta.y);
+                }
+            }
+            self.data[col_idx].update(&self.columns[col_idx]);
+            return true;
+        }
 
         if resize.data.edges.intersects(ResizeEdge::LEFT_RIGHT) {
             let mut dx = delta.x;
@@ -3803,6 +4208,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 assert_eq!(self.clock, column.clock);
                 assert_eq!(self.scale, column.scale);
                 column.verify_invariants();
+                column.verify_group_invariants();
 
                 let mut data2 = *data;
                 data2.update(column);
@@ -3829,6 +4235,820 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 "interactive resize window must be present in the layout"
             );
         }
+
+        assert!(
+            self.vacate_on_removal.is_none(),
+            "a vacancy is only prepared right before removing the window"
+        );
+    }
+}
+
+/// Where a dragged window came from, to send a window it swaps with there.
+#[derive(Debug, Clone)]
+pub(super) enum MoveOrigin<Id> {
+    /// The window's slot in a group was left vacant.
+    Vacancy,
+    /// The window was in a plain column with other windows.
+    Column { sibling: Id, tile_idx: usize },
+    /// The window was alone in its column.
+    Lone {
+        left_neighbor: Option<Id>,
+        width: ColumnWidth,
+        is_full_width: bool,
+    },
+}
+
+/// Split groups: the strip side. See `docs/wiki/Development:-Split-Groups.md`.
+impl<W: LayoutElement> ScrollingSpace<W> {
+    fn find_tile(&self, window: Option<&W::Id>) -> Option<(usize, usize)> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        match window {
+            Some(window) => self.columns.iter().enumerate().find_map(|(col_idx, col)| {
+                col.position(window).map(|tile_idx| (col_idx, tile_idx))
+            }),
+            None => {
+                let col = &self.columns[self.active_column_idx];
+                Some((self.active_column_idx, col.active_tile_idx))
+            }
+        }
+    }
+
+    /// Position of a tile in strip coordinates as it is drawn now, without its own offsets.
+    fn tile_strip_pos(&self, col_idx: usize, tile_idx: usize) -> Point<f64, Logical> {
+        let col = &self.columns[col_idx];
+        Point::from((self.column_x(col_idx), 0.)) + col.render_offset() + col.tile_offset(tile_idx)
+    }
+
+    /// The group id of the column with `window`, if it's in a group.
+    pub fn group_id_of(&self, window: &W::Id) -> Option<u64> {
+        let col = self.columns.iter().find(|col| col.contains(window))?;
+        col.group.as_ref().map(Group::id)
+    }
+
+    /// `split-window`: merge a lone window with its neighbour, or rotate its split.
+    pub fn split_window(&mut self, window: Option<&W::Id>) {
+        let Some((col_idx, tile_idx)) = self.find_tile(window) else {
+            return;
+        };
+        let col = &mut self.columns[col_idx];
+        // Not while a window is (or is still leaving) fullscreen or maximized.
+        if !col.pending_sizing_mode().is_normal()
+            || !col.sizing_mode().is_normal()
+            || col.display_mode == ColumnDisplay::Tabbed
+        {
+            return;
+        }
+        cancel_resize_for_column(&mut self.interactive_resize, col);
+
+        if col.group.is_some() {
+            col.rotate_split(tile_idx);
+            self.data[col_idx].update(&self.columns[col_idx]);
+            return;
+        }
+
+        if col.tiles.len() > 1 {
+            // A plain stack looks like a stacked split: rotating it puts the windows side by side.
+            col.make_group(SplitKind::Stacked);
+            col.rotate_split(tile_idx);
+            self.data[col_idx].update(&self.columns[col_idx]);
+            return;
+        }
+
+        // A lone window merges with the column to its right, or at the end of the strip, the
+        // one to its left.
+        let target = if col_idx + 1 < self.columns.len() {
+            col_idx + 1
+        } else if col_idx > 0 {
+            col_idx - 1
+        } else {
+            return;
+        };
+        let t = &self.columns[target];
+        if t.display_mode == ColumnDisplay::Tabbed
+            || !t.pending_sizing_mode().is_normal()
+            || !t.sizing_mode().is_normal()
+        {
+            return;
+        }
+        self.merge_column_into(col_idx, target);
+    }
+
+    /// Merges the lone window of column `source` into column `target` by the split rule.
+    fn merge_column_into(&mut self, source: usize, target: usize) {
+        debug_assert_eq!(self.columns[source].tiles.len(), 1);
+        let old_pos = self.tile_strip_pos(source, 0);
+        let was_active = self.active_column_idx == source;
+        let from_start = source < target;
+
+        if was_active {
+            self.activate_prev_column_on_removal = None;
+        }
+        cancel_resize_for_column(&mut self.interactive_resize, &mut self.columns[target]);
+        let removed = self.remove_tile_by_idx(
+            source,
+            0,
+            Transaction::new(),
+            Some(self.options.animations.window_movement.0),
+        );
+        let target = if source < target { target - 1 } else { target };
+        let col = &mut self.columns[target];
+        let idx = col.merge_tile(removed.tile, from_start);
+        self.data[target].update(&self.columns[target]);
+
+        if was_active {
+            self.columns[target].activate_idx(idx);
+            self.activate_column(target);
+        }
+
+        let new_pos = self.tile_strip_pos(target, idx);
+        self.columns[target].tiles[idx].animate_move_from(old_pos - new_pos);
+    }
+
+    /// `unsplit-window`: pops a window out of its group into its own column next to it.
+    pub fn unsplit_window(&mut self, window: Option<&W::Id>) {
+        let Some((col_idx, tile_idx)) = self.find_tile(window) else {
+            return;
+        };
+        let col = &self.columns[col_idx];
+        if col.group.is_some() {
+            let side = col.pop_out_side(tile_idx);
+            self.pop_out_of_group(col_idx, tile_idx, side);
+        } else if col.tiles.len() > 1 {
+            let window = col.tiles[tile_idx].window().id().clone();
+            self.consume_or_expel_window_right(Some(&window));
+        }
+    }
+
+    /// Takes tile `tile_idx` out of the group in column `col_idx` into a new column on `side`.
+    /// Returns the new column's index.
+    fn pop_out_of_group(
+        &mut self,
+        col_idx: usize,
+        tile_idx: usize,
+        side: ScrollDirection,
+    ) -> usize {
+        // Its only other slot is a dragged window's: it's alone already.
+        if self.columns[col_idx].tiles.len() == 1 {
+            self.columns[col_idx].clear_vacancy();
+            self.data[col_idx].update(&self.columns[col_idx]);
+            return col_idx;
+        }
+
+        let old_pos = self.tile_strip_pos(col_idx, tile_idx);
+        let col = &mut self.columns[col_idx];
+        let was_active = self.active_column_idx == col_idx && col.active_tile_idx == tile_idx;
+        cancel_resize_for_column(&mut self.interactive_resize, col);
+
+        let removed = self.remove_tile_by_idx(col_idx, tile_idx, Transaction::new(), None);
+        let new_idx = match side {
+            ScrollDirection::Left => col_idx,
+            ScrollDirection::Right => col_idx + 1,
+        };
+        self.add_tile(
+            Some(new_idx),
+            removed.tile,
+            was_active,
+            removed.width,
+            removed.is_full_width,
+            Some(self.options.animations.window_movement.0),
+        );
+        if was_active {
+            // Removing the new column right away should go back to the group.
+            self.activate_prev_column_on_removal = None;
+        }
+
+        let new_pos = self.tile_strip_pos(new_idx, 0);
+        self.columns[new_idx].tiles[0].animate_move_from(old_pos - new_pos);
+        new_idx
+    }
+
+    /// `split-window-beside`: puts `window` next to `target` on `side` as a new slot.
+    pub fn split_window_beside(&mut self, window: &W::Id, target: &W::Id, side: Side) -> bool {
+        if window == target {
+            return false;
+        }
+        let Some((t_col, _)) = self.find_tile(Some(target)) else {
+            return false;
+        };
+        let Some((w_col, w_tile)) = self.find_tile(Some(window)) else {
+            return false;
+        };
+        let t = &self.columns[t_col];
+        let w = &self.columns[w_col];
+        if t.display_mode == ColumnDisplay::Tabbed
+            || !t.pending_sizing_mode().is_normal()
+            || !t.sizing_mode().is_normal()
+            || !w.pending_sizing_mode().is_normal()
+            || !w.sizing_mode().is_normal()
+        {
+            return false;
+        }
+
+        let old_pos = self.tile_strip_pos(w_col, w_tile);
+        let was_active =
+            self.active_column_idx == w_col && self.columns[w_col].active_tile_idx == w_tile;
+        if was_active {
+            self.activate_prev_column_on_removal = None;
+        }
+        cancel_resize_for_column(&mut self.interactive_resize, &mut self.columns[t_col]);
+        cancel_resize_for_column(&mut self.interactive_resize, &mut self.columns[w_col]);
+
+        let removed = self.remove_tile_by_idx(w_col, w_tile, Transaction::new(), None);
+        let (t_col, t_tile) = self.find_tile(Some(target)).unwrap();
+        let col = &mut self.columns[t_col];
+        let idx = col.insert_tile_beside(t_tile, side, removed.tile);
+        self.data[t_col].update(&self.columns[t_col]);
+        if was_active {
+            self.columns[t_col].activate_idx(idx);
+            self.activate_column(t_col);
+        }
+        let new_pos = self.tile_strip_pos(t_col, idx);
+        self.columns[t_col].tiles[idx].animate_move_from(old_pos - new_pos);
+        true
+    }
+
+    /// Swaps the tile at (a) with the tile at (b) in place, across columns. The slots and column
+    /// sizes stay; only the windows move.
+    fn exchange_tiles(&mut self, a: (usize, usize), b: (usize, usize)) {
+        if a == b {
+            return;
+        }
+        let pos_a = self.tile_strip_pos(a.0, a.1);
+        let pos_b = self.tile_strip_pos(b.0, b.1);
+
+        if a.0 == b.0 {
+            // The slots keep their data (height, slot rectangle); only the windows move.
+            let col = &mut self.columns[a.0];
+            col.tiles.swap(a.1, b.1);
+            col.data[a.1].update(&col.tiles[a.1]);
+            col.data[b.1].update(&col.tiles[b.1]);
+        } else {
+            let (first, second) = if a.0 < b.0 { (a, b) } else { (b, a) };
+            let (left, right) = self.columns.split_at_mut(second.0);
+            let c1 = &mut left[first.0];
+            let c2 = &mut right[0];
+            std::mem::swap(&mut c1.tiles[first.1], &mut c2.tiles[second.1]);
+            c1.tiles[first.1].update_config(c1.view_size, c1.scale, c1.options.clone());
+            c2.tiles[second.1].update_config(c2.view_size, c2.scale, c2.options.clone());
+            c1.data[first.1].update(&c1.tiles[first.1]);
+            c2.data[second.1].update(&c2.tiles[second.1]);
+        }
+
+        for col_idx in [a.0, b.0] {
+            let col = &mut self.columns[col_idx];
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            col.update_tile_sizes(true);
+            self.data[col_idx].update(col);
+        }
+
+        let new_a = self.tile_strip_pos(a.0, a.1);
+        let new_b = self.tile_strip_pos(b.0, b.1);
+        // The tile now at `a` came from `b`, and the other way around.
+        self.columns[a.0].tiles[a.1].animate_move_from(pos_b - new_a);
+        self.columns[b.0].tiles[b.1].animate_move_from(pos_a - new_b);
+    }
+
+    /// Moves a window within its group towards `side` (swapping slots), or out of the group at
+    /// its left/right edge. Returns `false` if it isn't in a group or nothing happened.
+    fn group_move_tile(&mut self, col_idx: usize, tile_idx: usize, side: Side) -> bool {
+        let col = &mut self.columns[col_idx];
+        if col.group.is_none() {
+            return false;
+        }
+        let was_active = col.active_tile_idx == tile_idx;
+        if let Some(other) = col.group_neighbor(tile_idx, side) {
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            self.exchange_tiles((col_idx, tile_idx), (col_idx, other));
+            if was_active {
+                self.columns[col_idx].activate_idx(other);
+            } else if self.columns[col_idx].active_tile_idx == other {
+                self.columns[col_idx].activate_idx(tile_idx);
+            }
+            return true;
+        }
+        match side {
+            Side::Left => {
+                self.pop_out_of_group(col_idx, tile_idx, ScrollDirection::Left);
+                true
+            }
+            Side::Right => {
+                self.pop_out_of_group(col_idx, tile_idx, ScrollDirection::Right);
+                true
+            }
+            Side::Top | Side::Bottom => false,
+        }
+    }
+
+    /// Removes tile `tile_idx` from the group in column `column_idx` (which keeps other tiles).
+    fn remove_group_tile(
+        &mut self,
+        column_idx: usize,
+        tile_idx: usize,
+        transaction: Transaction,
+        anim_config: Option<niri_config::Animation>,
+    ) -> RemovedTile<W> {
+        let movement_config = anim_config.unwrap_or(self.options.animations.window_movement.0);
+        let prev_width = self.data[column_idx].width;
+
+        let column = &mut self.columns[column_idx];
+        let window = column.tiles[tile_idx].window().id().clone();
+        let vacate = self.vacate_on_removal.as_ref() == Some(&window);
+        if vacate {
+            self.vacate_on_removal = None;
+        }
+        // Inner resizes refer to the tree as it was.
+        cancel_resize_for_column(&mut self.interactive_resize, column);
+
+        let was_normal = column.sizing_mode().is_normal();
+        let (width, is_full_width) = column.width_for_slot(tile_idx);
+        let (tile, _data) = column.group_remove_tile(tile_idx, vacate);
+
+        // If an active column became non-fullscreen after removing the tile, clear the stored
+        // unfullscreen offset.
+        if column_idx == self.active_column_idx && !was_normal && column.sizing_mode().is_normal() {
+            self.view_offset_to_restore = None;
+        }
+
+        if tile_idx < column.active_tile_idx {
+            column.active_tile_idx -= 1;
+        } else if tile_idx == column.active_tile_idx && tile_idx == column.tiles.len() {
+            column.active_tile_idx = tile_idx - 1;
+        }
+        let active = column.active_tile_idx;
+        column.tiles[active].ensure_alpha_animates_to_1();
+
+        if column.group.is_some() {
+            column.update_group_sizes(true, transaction, Some(movement_config));
+        } else {
+            column.update_tile_sizes_with_transaction(true, transaction);
+        }
+        self.data[column_idx].update(column);
+
+        let offset = prev_width - self.data[column_idx].width;
+        if offset != 0. {
+            if self.active_column_idx <= column_idx {
+                for col in &mut self.columns[column_idx + 1..] {
+                    col.animate_move_from_with_config(offset, movement_config);
+                }
+            } else {
+                for col in &mut self.columns[..=column_idx] {
+                    col.animate_move_from_with_config(-offset, movement_config);
+                }
+            }
+        }
+
+        RemovedTile {
+            tile,
+            width,
+            is_full_width,
+            is_floating: false,
+        }
+    }
+
+    /// Clears a group vacancy left by a drag, in every column.
+    pub fn clear_vacancies(&mut self) {
+        for (col, data) in zip(&mut self.columns, &mut self.data) {
+            if col.clear_vacancy() {
+                data.update(col);
+            }
+        }
+    }
+
+    pub fn has_vacancy(&self) -> bool {
+        self.columns.iter().any(Column::has_vacancy)
+    }
+
+    /// The next removal of `window` from a group leaves its slot vacant (for a drag).
+    pub fn prepare_vacancy(&mut self, window: &W::Id) {
+        if self
+            .columns
+            .iter()
+            .any(|col| col.group.is_some() && col.contains(window))
+        {
+            self.vacate_on_removal = Some(window.clone());
+        }
+    }
+
+    /// Where `window` is, to send a window it gets swapped with there.
+    pub(super) fn move_origin(&self, window: &W::Id) -> Option<MoveOrigin<W::Id>> {
+        let (col_idx, tile_idx) = self.find_tile(Some(window))?;
+        let col = &self.columns[col_idx];
+        if col.group.is_some() {
+            return Some(MoveOrigin::Vacancy);
+        }
+        if col.tiles.len() > 1 {
+            let sibling = if tile_idx > 0 { tile_idx - 1 } else { 1 };
+            return Some(MoveOrigin::Column {
+                sibling: col.tiles[sibling].window().id().clone(),
+                tile_idx,
+            });
+        }
+        Some(MoveOrigin::Lone {
+            left_neighbor: col_idx
+                .checked_sub(1)
+                .map(|idx| self.columns[idx].tiles[0].window().id().clone()),
+            width: col.width,
+            is_full_width: col.is_full_width,
+        })
+    }
+
+    /// Puts a tile that was swapped out of a group at a dragged window's origin. Gives the tile
+    /// back if the origin is gone (the caller puts it somewhere else).
+    pub(super) fn place_at_origin(
+        &mut self,
+        tile: Tile<W>,
+        origin: &MoveOrigin<W::Id>,
+    ) -> Option<Tile<W>> {
+        match origin {
+            MoveOrigin::Vacancy => {
+                let Some(col_idx) = self.columns.iter().position(Column::has_vacancy) else {
+                    return Some(tile);
+                };
+                let col = &mut self.columns[col_idx];
+                col.fill_vacancy(tile);
+                self.data[col_idx].update(&self.columns[col_idx]);
+            }
+            MoveOrigin::Column { sibling, tile_idx } => {
+                let Some(col_idx) = self.columns.iter().position(|c| c.contains(sibling)) else {
+                    return Some(tile);
+                };
+                let idx = (*tile_idx).min(self.columns[col_idx].tiles.len());
+                self.add_tile_to_column(col_idx, Some(idx), tile, false);
+            }
+            MoveOrigin::Lone {
+                left_neighbor,
+                width,
+                is_full_width,
+            } => {
+                let idx = match left_neighbor {
+                    Some(id) => match self.columns.iter().position(|c| c.contains(id)) {
+                        Some(idx) => idx + 1,
+                        None => return Some(tile),
+                    },
+                    None => 0,
+                };
+                self.add_tile(Some(idx), tile, false, *width, *is_full_width, None);
+            }
+        }
+        None
+    }
+
+    /// Drop onto a window in a group: the dragged tile takes its slot, the window comes out.
+    pub fn swap_into_group(
+        &mut self,
+        col_idx: usize,
+        tile_idx: usize,
+        mut tile: Tile<W>,
+        activate: bool,
+    ) -> Tile<W> {
+        let col = &mut self.columns[col_idx];
+        cancel_resize_for_column(&mut self.interactive_resize, col);
+        tile.update_config(col.view_size, col.scale, col.options.clone());
+        let old = std::mem::replace(&mut col.tiles[tile_idx], tile);
+        col.data[tile_idx].update(&col.tiles[tile_idx]);
+        col.update_tile_sizes(true);
+        self.data[col_idx].update(&self.columns[col_idx]);
+        if activate {
+            self.columns[col_idx].activate_idx(tile_idx);
+            self.activate_column(col_idx);
+        }
+        old
+    }
+
+    /// Drop into a crevice (or onto an edge) of a group.
+    pub fn insert_into_group(
+        &mut self,
+        col_idx: usize,
+        slot: usize,
+        side: Side,
+        tile: Tile<W>,
+        activate: bool,
+    ) {
+        let col = &mut self.columns[col_idx];
+        cancel_resize_for_column(&mut self.interactive_resize, col);
+        let Some(group) = &col.group else {
+            self.add_tile_to_column(col_idx, None, tile, activate);
+            return;
+        };
+        let Some((path, _)) = group.slots().get(slot).cloned() else {
+            self.add_tile_to_column(col_idx, None, tile, activate);
+            return;
+        };
+        let target = group.edge_target(&path, side);
+        let idx = match target {
+            EdgeTarget::NewColumn { right } => {
+                let new_idx = if right { col_idx + 1 } else { col_idx };
+                self.add_tile(
+                    Some(new_idx),
+                    tile,
+                    activate,
+                    ColumnWidth::Proportion(0.5),
+                    false,
+                    None,
+                );
+                return;
+            }
+            target => col.insert_tile_at_target(&target, tile),
+        };
+        self.data[col_idx].update(&self.columns[col_idx]);
+        if activate {
+            self.columns[col_idx].activate_idx(idx);
+            self.activate_column(col_idx);
+        }
+    }
+
+    /// Drop back into the dragged window's own vacant slot.
+    pub fn fill_vacancy(
+        &mut self,
+        col_idx: usize,
+        tile: Tile<W>,
+        activate: bool,
+    ) -> Option<Tile<W>> {
+        let col = &mut self.columns[col_idx];
+        if !col.has_vacancy() {
+            return Some(tile);
+        }
+        let idx = col.fill_vacancy(tile).unwrap();
+        self.data[col_idx].update(&self.columns[col_idx]);
+        if activate {
+            self.columns[col_idx].activate_idx(idx);
+            self.activate_column(col_idx);
+        }
+        None
+    }
+
+    /// Sends a window that went fullscreen or maximized from a group back into its slot.
+    fn return_home(&mut self, col_idx: usize) {
+        let col = &mut self.columns[col_idx];
+        let Some(home) = col.group_home.take() else {
+            return;
+        };
+        if col.tiles.len() != 1 || !col.pending_sizing_mode().is_normal() {
+            return;
+        }
+        let window = col.tiles[0].window().id().clone();
+        let others: Vec<W::Id> = home
+            .windows
+            .iter()
+            .filter(|w| **w != window)
+            .cloned()
+            .collect();
+        let Some(first) = others.first() else {
+            return;
+        };
+
+        // The group as it would be without the window.
+        let mut expected = home.tree.clone();
+        let home_path = home.tree.path_of_tile(home.index);
+        let expected_is_group = expected.remove_slot(&home_path);
+
+        let target = self.columns.iter().position(|c| c.contains(first));
+        let exact = target.is_some_and(|t| {
+            let c = &self.columns[t];
+            let ids: Vec<&W::Id> = c.tiles.iter().map(|t| t.window().id()).collect();
+            ids == others.iter().collect::<Vec<_>>()
+                && c.display_mode == ColumnDisplay::Normal
+                && c.pending_sizing_mode().is_normal()
+                && match &c.group {
+                    Some(g) => {
+                        expected_is_group
+                            && !g.has_vacancy()
+                            && same_shape(g.root(), expected.root())
+                    }
+                    None => !expected_is_group && others.len() == 1,
+                }
+        });
+
+        let old_pos = self.tile_strip_pos(col_idx, 0);
+        let was_active = self.active_column_idx == col_idx;
+
+        if exact {
+            if was_active {
+                self.activate_prev_column_on_removal = None;
+            }
+            let removed = self.remove_tile_by_idx(col_idx, 0, Transaction::new(), None);
+            let t = self.columns.iter().position(|c| c.contains(first)).unwrap();
+            let col = &mut self.columns[t];
+            cancel_resize_for_column(&mut self.interactive_resize, col);
+            let mut tree = home.tree;
+            if let Some(g) = &col.group {
+                tree.set_id(g.id());
+            } else {
+                // The group had dissolved: its last window animates from where it is.
+                let offset = col.tile_offset(0) - col.tiles_origin();
+                col.data[0].group_rect = Some(Rectangle::new(offset, col.data[0].size));
+                col.data[0].height = WindowHeight::auto_1();
+            }
+            col.group = Some(tree);
+            col.group_home = None;
+            let path = col.group.as_ref().unwrap().path_of_tile(home.index);
+            let idx = col.group_add_tile_at_path(path, removed.tile);
+            self.data[t].update(&self.columns[t]);
+            if was_active {
+                self.columns[t].activate_idx(idx);
+                self.activate_column(t);
+            }
+            let new_pos = self.tile_strip_pos(t, idx);
+            self.columns[t].tiles[idx].animate_move_from(old_pos - new_pos);
+            return;
+        }
+
+        if let Some((anchor, side)) = &home.anchor {
+            let ok = self.columns.iter().any(|c| {
+                c.contains(anchor)
+                    && c.display_mode == ColumnDisplay::Normal
+                    && c.pending_sizing_mode().is_normal()
+            });
+            if ok {
+                self.split_window_beside(&window, anchor, *side);
+            }
+        }
+    }
+
+    /// Group geometry for IPC and the shell: (group id, rectangle in workspace view coordinates,
+    /// windows in slot order).
+    pub fn groups_with_render_rects(
+        &self,
+    ) -> impl Iterator<Item = (u64, Rectangle<f64, Logical>, Vec<&W>)> + '_ {
+        let scale = self.scale;
+        let view_off = Point::from((-self.view_pos(), 0.));
+        zip(&self.columns, self.column_xs(self.data.iter().copied())).filter_map(
+            move |(col, col_x)| {
+                let group = col.group.as_ref()?;
+                let pos =
+                    view_off + Point::from((col_x, 0.)) + col.render_offset() + col.tiles_origin();
+                let pos = pos.to_physical_precise_round(scale).to_logical(scale);
+                let windows = col.tiles.iter().map(|t| t.window()).collect();
+                Some((group.id(), Rectangle::new(pos, group.size()), windows))
+            },
+        )
+    }
+
+    /// Animates the other columns after a group's width changed (plain columns do this when
+    /// their windows commit the new size; a group's width is its target width).
+    fn animate_group_width_change(&mut self, col_idx: usize, prev_width: f64) {
+        if self.columns.get(col_idx).is_none_or(|c| c.group.is_none()) {
+            return;
+        }
+        self.data[col_idx].update(&self.columns[col_idx]);
+        let offset = self.data[col_idx].width - prev_width;
+        if offset == 0. {
+            return;
+        }
+        let config = self.options.animations.window_resize.anim;
+        if self.active_column_idx <= col_idx {
+            for col in &mut self.columns[col_idx + 1..] {
+                col.animate_move_from_with_config(-offset, config);
+            }
+        } else {
+            for col in &mut self.columns[..=col_idx] {
+                col.animate_move_from_with_config(offset, config);
+            }
+        }
+        if col_idx == self.active_column_idx
+            && self.interactive_resize.is_none()
+            && !self.view_offset.is_gesture()
+        {
+            self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
+        }
+    }
+
+    /// Hit test for a drop over the group in column `col_idx`; `pos` in strip coordinates.
+    fn group_insert_position(&self, col_idx: usize, pos: Point<f64, Logical>) -> InsertPosition {
+        let col = &self.columns[col_idx];
+        let group = col.group.as_ref().unwrap();
+        let origin = Point::from((self.column_x(col_idx), 0.)) + col.tiles_origin();
+        let p = pos - origin;
+        let gaps = self.options.layout.gaps;
+        let slots = group.slots();
+        let rects = group.slot_rects();
+
+        let lo = f64::max(24., gaps);
+        let zone = |len: f64| (len * 0.25).max(lo).min(f64::max(100., lo)).min(len / 2.);
+
+        // Inside a slot?
+        for (idx, (rect, (_, vacant))) in zip(rects, &slots).enumerate() {
+            if !rect.contains(p) {
+                continue;
+            }
+            if *vacant {
+                return InsertPosition::GroupVacancy(col_idx);
+            }
+            let (zx, zy) = (zone(rect.size.w), zone(rect.size.h));
+            let dists = [
+                (Side::Left, (p.x - rect.loc.x) / zx),
+                (Side::Right, (rect.loc.x + rect.size.w - p.x) / zx),
+                (Side::Top, (p.y - rect.loc.y) / zy),
+                (Side::Bottom, (rect.loc.y + rect.size.h - p.y) / zy),
+            ];
+            let (side, d) = dists
+                .into_iter()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            if d >= 1. {
+                let tile = group.tile_of_path(&slots[idx].0).unwrap();
+                return InsertPosition::GroupSwap(col_idx, tile);
+            }
+            return self.group_edge_position(col_idx, idx, side);
+        }
+
+        // In a gap or outside: the nearest slot edge.
+        let mut best: Option<(usize, Side, f64)> = None;
+        for (idx, rect) in rects.iter().enumerate() {
+            let dx = if p.x < rect.loc.x {
+                rect.loc.x - p.x
+            } else if p.x >= rect.loc.x + rect.size.w {
+                p.x - (rect.loc.x + rect.size.w)
+            } else {
+                0.
+            };
+            let dy = if p.y < rect.loc.y {
+                rect.loc.y - p.y
+            } else if p.y >= rect.loc.y + rect.size.h {
+                p.y - (rect.loc.y + rect.size.h)
+            } else {
+                0.
+            };
+            let dist = dx.hypot(dy);
+            let side = if dx >= dy {
+                if p.x < rect.loc.x {
+                    Side::Left
+                } else {
+                    Side::Right
+                }
+            } else if p.y < rect.loc.y {
+                Side::Top
+            } else {
+                Side::Bottom
+            };
+            if best.is_none_or(|(_, _, d)| dist < d) {
+                best = Some((idx, side, dist));
+            }
+        }
+        // Outside the slots, even the dragged window's own vacant slot counts by its edges: from
+        // the gap next to the group the window goes out into a new column.
+        let (idx, side, _) = best.unwrap();
+        self.group_edge_position(col_idx, idx, side)
+    }
+
+    fn group_edge_position(&self, col_idx: usize, slot: usize, side: Side) -> InsertPosition {
+        let group = self.columns[col_idx].group.as_ref().unwrap();
+        let path = &group.slots()[slot].0;
+        match group.edge_target(path, side) {
+            EdgeTarget::NewColumn { right: false } => InsertPosition::NewColumn(col_idx),
+            EdgeTarget::NewColumn { right: true } => InsertPosition::NewColumn(col_idx + 1),
+            _ => InsertPosition::GroupEdge(col_idx, slot, side),
+        }
+    }
+
+    /// Hint rectangle for the group drop positions, in strip coordinates.
+    fn group_hint_area(&self, position: InsertPosition) -> Option<Rectangle<f64, Logical>> {
+        let (col_idx, rect) = match position {
+            InsertPosition::GroupEdge(col_idx, slot, side) => {
+                let group = self.columns.get(col_idx)?.group.as_ref()?;
+                let path = group.slots().get(slot)?.0.clone();
+                let target = group.edge_target(&path, side);
+                let gaps = self.options.layout.gaps;
+                let thickness = (gaps * 2.).clamp(12., 32.);
+                (col_idx, group.edge_target_line(&target, thickness, gaps)?)
+            }
+            InsertPosition::GroupSwap(col_idx, tile_idx) => {
+                let group = self.columns.get(col_idx)?.group.as_ref()?;
+                (col_idx, *group.filled_rects().get(tile_idx)?)
+            }
+            InsertPosition::GroupVacancy(col_idx) => {
+                let group = self.columns.get(col_idx)?.group.as_ref()?;
+                (col_idx, group.vacancy()?.1)
+            }
+            _ => return None,
+        };
+        let col = &self.columns[col_idx];
+        let origin = Point::from((self.column_x(col_idx), 0.)) + col.tiles_origin();
+        Some(Rectangle::new(origin + rect.loc, rect.size))
+    }
+}
+
+/// Whether two trees have the same splits and slots (shares aside).
+fn same_shape(a: &group::Node, b: &group::Node) -> bool {
+    match (a, b) {
+        (group::Node::Slot { vacant: va }, group::Node::Slot { vacant: vb }) => va == vb,
+        (
+            group::Node::Split {
+                kind: ka,
+                children: ca,
+            },
+            group::Node::Split {
+                kind: kb,
+                children: cb,
+            },
+        ) => {
+            ka == kb
+                && ca.len() == cb.len()
+                && zip(ca, cb).all(|(x, y)| same_shape(&x.node, &y.node))
+        }
+        _ => false,
     }
 }
 
@@ -3935,6 +5155,7 @@ impl TileData {
             height,
             size: Size::default(),
             interactively_resizing_by_left_edge: false,
+            group_rect: None,
         };
         rv.update(tile);
         rv
@@ -4017,6 +5238,8 @@ impl<W: LayoutElement> Column<W> {
             scale,
             clock: tile.clock.clone(),
             options,
+            group: None,
+            group_home: None,
         };
 
         let pending_sizing_mode = tile.window().pending_sizing_mode();
@@ -4334,7 +5557,15 @@ impl<W: LayoutElement> Column<W> {
         self.activate_idx(idx);
     }
 
-    fn add_tile_at(&mut self, idx: usize, mut tile: Tile<W>) {
+    /// Adds a tile at `idx`; returns the index it ended up at.
+    ///
+    /// A group puts the tile into a new slot by the split rule (from the right), wherever `idx`
+    /// points.
+    fn add_tile_at(&mut self, idx: usize, mut tile: Tile<W>) -> usize {
+        if self.group.is_some() {
+            return self.merge_tile(tile, false);
+        }
+
         tile.update_config(self.view_size, self.scale, self.options.clone());
 
         // Inserting a tile pushes down all tiles below it, but also in always-centering mode it
@@ -4346,6 +5577,9 @@ impl<W: LayoutElement> Column<W> {
             self.is_pending_fullscreen = false;
             self.is_pending_maximized = false;
         }
+
+        // A column with more windows is no longer a group window's own fullscreen column.
+        self.group_home = None;
 
         self.data
             .insert(idx, TileData::new(&tile, WindowHeight::auto_1()));
@@ -4361,6 +5595,8 @@ impl<W: LayoutElement> Column<W> {
 
             tile.animate_move_from(prev - offset);
         }
+
+        idx
     }
 
     fn update_window(&mut self, window: &W::Id) {
@@ -4375,6 +5611,11 @@ impl<W: LayoutElement> Column<W> {
 
         tile.update_window();
         self.data[tile_idx].update(tile);
+
+        // Tiles in a group sit in their slots and don't move with each other's sizes.
+        if self.group.is_some() {
+            return;
+        }
 
         let offset = prev_height - self.data[tile_idx].size.h;
 
@@ -4456,6 +5697,12 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn update_tile_sizes_with_transaction(&mut self, animate: bool, transaction: Transaction) {
+        if self.group.is_some() {
+            let config = animate.then_some(self.options.animations.window_resize.anim);
+            self.update_group_sizes(animate, transaction, config);
+            return;
+        }
+
         let sizing_mode = self.pending_sizing_mode();
         if matches!(sizing_mode, SizingMode::Fullscreen | SizingMode::Maximized) {
             for (tile_idx, tile) in self.tiles.iter_mut().enumerate() {
@@ -4750,6 +5997,13 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn width(&self) -> f64 {
+        // A group's width is its target width: inside a group, tiles change size together (in one
+        // transaction) while the group keeps its size, and the column actions that change it
+        // animate the neighbouring columns themselves.
+        if let Some(group) = &self.group {
+            return group.size().w;
+        }
+
         let mut tiles_width = self
             .data
             .iter()
@@ -4772,10 +6026,16 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn focus_up(&mut self) -> bool {
+        if self.group.is_some() {
+            return self.group_focus(Side::Top);
+        }
         self.activate_idx(self.active_tile_idx.saturating_sub(1))
     }
 
     fn focus_down(&mut self) -> bool {
+        if self.group.is_some() {
+            return self.group_focus(Side::Bottom);
+        }
         self.activate_idx(min(self.active_tile_idx + 1, self.tiles.len() - 1))
     }
 
@@ -4788,6 +6048,9 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn move_up(&mut self) -> bool {
+        if self.group.is_some() {
+            return self.group_move(Side::Top);
+        }
         let new_idx = self.active_tile_idx.saturating_sub(1);
         if self.active_tile_idx == new_idx {
             return false;
@@ -4811,6 +6074,9 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn move_down(&mut self) -> bool {
+        if self.group.is_some() {
+            return self.group_move(Side::Bottom);
+        }
         let new_idx = min(self.active_tile_idx + 1, self.tiles.len() - 1);
         if self.active_tile_idx == new_idx {
             return false;
@@ -4847,8 +6113,15 @@ impl<W: LayoutElement> Column<W> {
             (idx + if forwards { 1 } else { len - 1 }) % len
         } else {
             let tile = &self.tiles[tile_idx];
-            let current_window = tile.window_expected_or_current_size().w;
-            let current_tile = tile.tile_expected_or_current_size().w;
+            let (current_window, current_tile) = if let Some(group) = &self.group {
+                // A group's width is the whole group's.
+                (group.size().w, group.size().w)
+            } else {
+                (
+                    tile.window_expected_or_current_size().w,
+                    tile.tile_expected_or_current_size().w,
+                )
+            };
 
             let mut it = self
                 .options
@@ -4910,6 +6183,10 @@ impl<W: LayoutElement> Column<W> {
         const MAX_F: f64 = 10000.;
 
         let width = match (current, change) {
+            (_, SizeChange::SetFixed(fixed)) if self.group.is_some() => {
+                // For a group, a fixed width is the whole group's.
+                ColumnWidth::Fixed(f64::from(fixed).clamp(1., MAX_PX))
+            }
             (_, SizeChange::SetFixed(fixed)) => {
                 // As a special case, setting a fixed column width will compute it in such a way
                 // that the specified (usually active) window gets that width. This is the
@@ -5241,6 +6518,7 @@ impl<W: LayoutElement> Column<W> {
         let center = self.options.layout.center_focused_column == CenterFocusedColumn::Always;
         let gaps = self.options.layout.gaps;
         let tabbed = self.display_mode == ColumnDisplay::Tabbed;
+        let grouped = self.group.is_some();
 
         // Does not include extra size from the tab indicator.
         let tiles_width = self
@@ -5258,11 +6536,17 @@ impl<W: LayoutElement> Column<W> {
             height: WindowHeight::auto_1(),
             size: Size::default(),
             interactively_resizing_by_left_edge: false,
+            group_rect: None,
         };
         let data = data.chain(iter::once(dummy));
 
         data.map(move |data| {
             let mut pos = origin;
+
+            // In a group, tiles sit in their slots.
+            if grouped {
+                return pos + data.group_rect.map_or_else(Point::default, |r| r.loc);
+            }
 
             if center {
                 pos.x += (tiles_width - data.size.w) / 2.;
@@ -5477,6 +6761,7 @@ impl<W: LayoutElement> Column<W> {
         }
 
         if !is_tabbed
+            && self.group.is_none()
             && tile_count > 1
             && self.scale.round() == self.scale
             && working_size.h.round() == working_size.h
@@ -5489,6 +6774,683 @@ impl<W: LayoutElement> Column<W> {
                 total_height <= max_height,
                 "multiple tiles in a column mustn't go beyond working area height \
                  (total height {total_height} > max height {max_height})"
+            );
+        }
+    }
+}
+
+/// Split groups: the column side. See `docs/wiki/Development:-Split-Groups.md`.
+impl<W: LayoutElement> Column<W> {
+    /// The split group this column is, if any.
+    pub fn group(&self) -> Option<&Group> {
+        self.group.as_ref()
+    }
+
+    /// The width this column is meant to have (rather than what its windows have committed).
+    fn target_width(&self) -> f64 {
+        if let Some(group) = &self.group {
+            return group.size().w;
+        }
+        let width = if self.is_full_width || self.is_pending_maximized {
+            ColumnWidth::Proportion(1.)
+        } else {
+            self.width
+        };
+        f64::max(1., self.resolve_column_width(width))
+    }
+
+    /// Height of a group's area: the working area minus the gaps above and below.
+    fn group_height(&self) -> f64 {
+        f64::max(1., self.working_area.size.h - self.options.layout.gaps * 2.)
+    }
+
+    fn group_min_sizes(&self) -> Vec<Size<f64, Logical>> {
+        self.tiles
+            .iter()
+            .map(|tile| {
+                let mut size = tile.min_size_nonfullscreen();
+                size.w = size.w.max(1.);
+                size.h = size.h.max(1.);
+                size
+            })
+            .collect()
+    }
+
+    /// Target rectangles of the filled slots, in tile order, relative to the group's top-left.
+    fn group_rects(&self) -> Vec<Rectangle<f64, Logical>> {
+        self.group
+            .as_ref()
+            .map(Group::filled_rects)
+            .unwrap_or_default()
+    }
+
+    /// Lays out the group and requests the tile sizes.
+    ///
+    /// Tiles whose slot moved animate from their previous position with `move_config`.
+    fn update_group_sizes(
+        &mut self,
+        animate: bool,
+        transaction: Transaction,
+        move_config: Option<niri_config::Animation>,
+    ) {
+        let gaps = self.options.layout.gaps;
+        let mins = self.group_min_sizes();
+        let width = if self.is_full_width || self.is_pending_maximized {
+            ColumnWidth::Proportion(1.)
+        } else {
+            self.width
+        };
+        let width = self.resolve_column_width(width);
+        let height = self.group_height();
+
+        let group = self.group.as_mut().unwrap();
+        let min = group.min_size(gaps, &mins);
+        group.layout(Size::from((width.max(min.w).max(1.), height)), gaps, &mins);
+        let rects = group.filled_rects();
+
+        for ((tile, data), rect) in zip(zip(&mut self.tiles, &mut self.data), rects) {
+            if let (Some(old), Some(config)) = (data.group_rect, move_config) {
+                let delta = old.loc - rect.loc;
+                if delta.x != 0. {
+                    tile.animate_move_x_from_with_config(delta.x, config);
+                }
+                if delta.y != 0. {
+                    tile.animate_move_y_from_with_config(delta.y, config);
+                }
+            }
+            data.group_rect = Some(rect);
+            tile.request_tile_size(rect.size, animate, Some(transaction.clone()));
+        }
+    }
+
+    /// Re-lays out after a change of the tree: slots that moved animate with window-movement.
+    fn relayout_group(&mut self) {
+        let config = self.options.animations.window_movement.0;
+        self.update_group_sizes(true, Transaction::new(), Some(config));
+    }
+
+    /// Turns a plain column into a group of `kind`, the tiles' current sizes becoming the shares.
+    fn make_group(&mut self, kind: SplitKind) {
+        assert!(self.group.is_none());
+        assert!(self.tiles.len() >= 2);
+        let shares: Vec<f64> = self
+            .tiles
+            .iter()
+            .map(|tile| match kind {
+                SplitKind::Stacked => tile.tile_size().h,
+                SplitKind::SideBySide => tile.tile_size().w,
+            })
+            .collect();
+        // The tiles keep their current positions as the "before" of the first layout.
+        let offsets: Vec<_> = self.tile_offsets().take(self.tiles.len()).collect();
+        let origin = self.tiles_origin();
+        for (data, offset) in zip(&mut self.data, offsets) {
+            data.group_rect = Some(Rectangle::new(offset - origin, data.size));
+            data.height = WindowHeight::auto_1();
+        }
+        self.display_mode = ColumnDisplay::Normal;
+        self.group = Some(Group::new(kind, self.tiles.len(), Some(&shares)));
+        self.group_home = None;
+    }
+
+    /// Dissolves the group back into a plain column (one tile left).
+    fn dissolve_group(&mut self) {
+        self.group = None;
+        for data in &mut self.data {
+            data.height = WindowHeight::auto_1();
+            data.group_rect = None;
+        }
+    }
+
+    /// Inserts `tile` into the slot that `make_slot` adds to the tree; returns its tile index.
+    fn group_add_tile(
+        &mut self,
+        make_slot: impl FnOnce(&mut Group) -> group::Path,
+        mut tile: Tile<W>,
+    ) -> usize {
+        tile.update_config(self.view_size, self.scale, self.options.clone());
+        let group = self.group.as_mut().unwrap();
+        let path = make_slot(group);
+        let idx = group.tile_of_path(&path).expect("new slot must be filled");
+
+        // The new tile starts where it would be in the old layout's place: no move animation from
+        // its stale position, the caller animates it.
+        self.data
+            .insert(idx, TileData::new(&tile, WindowHeight::auto_1()));
+        self.tiles.insert(idx, tile);
+        if idx <= self.active_tile_idx && self.tiles.len() > 1 {
+            self.active_tile_idx += 1;
+        }
+        self.relayout_group();
+        idx
+    }
+
+    /// Merges `tile` into this column by the split rule: it takes half of the column's area along
+    /// its longer side, on the side it came from (`from_start`: from the left). Returns the tile
+    /// index.
+    fn merge_tile(&mut self, tile: Tile<W>, from_start: bool) -> usize {
+        let kind = SplitKind::for_area(self.target_width(), self.group_height());
+        let side = match (kind, from_start) {
+            (SplitKind::SideBySide, true) => Side::Left,
+            (SplitKind::SideBySide, false) => Side::Right,
+            (SplitKind::Stacked, true) => Side::Top,
+            (SplitKind::Stacked, false) => Side::Bottom,
+        };
+
+        if self.group.is_none() {
+            if self.tiles.len() == 1 {
+                return self.group_add_tile_into_single(kind, side, tile);
+            }
+            self.make_group(SplitKind::Stacked);
+        }
+        self.group_add_tile(|g| g.insert_at_group_side(side), tile)
+    }
+
+    /// Makes a group of two from a single-tile column with `tile` on `side`.
+    fn group_add_tile_into_single(&mut self, kind: SplitKind, side: Side, tile: Tile<W>) -> usize {
+        assert_eq!(self.tiles.len(), 1);
+        let new_first = side.is_start();
+        // The existing tile animates from where it is now.
+        let offset = self.tile_offset(0) - self.tiles_origin();
+        self.data[0].group_rect = Some(Rectangle::new(offset, self.data[0].size));
+        self.data[0].height = WindowHeight::auto_1();
+        self.display_mode = ColumnDisplay::Normal;
+        self.group_home = None;
+        self.group = Some(Group::new(kind, 2, None));
+        let path = vec![if new_first { 0 } else { 1 }];
+        self.group_add_tile_at_path(path, tile)
+    }
+
+    /// Adds `tile` into the slot at `path`, which the tree already has as filled.
+    fn group_add_tile_at_path(&mut self, path: group::Path, mut tile: Tile<W>) -> usize {
+        tile.update_config(self.view_size, self.scale, self.options.clone());
+        let group = self.group.as_ref().unwrap();
+        let idx = group.tile_of_path(&path).unwrap();
+        self.data
+            .insert(idx, TileData::new(&tile, WindowHeight::auto_1()));
+        self.tiles.insert(idx, tile);
+        if idx <= self.active_tile_idx && self.tiles.len() > 1 {
+            self.active_tile_idx += 1;
+        }
+        self.relayout_group();
+        idx
+    }
+
+    /// Puts `tile` next to tile `anchor` on `side`, making a group if needed. Returns the index.
+    fn insert_tile_beside(&mut self, anchor: usize, side: Side, tile: Tile<W>) -> usize {
+        if self.group.is_none() {
+            if self.tiles.len() == 1 {
+                return self.group_add_tile_into_single(side.kind(), side, tile);
+            }
+            self.make_group(SplitKind::Stacked);
+        }
+        let path = self.group.as_ref().unwrap().path_of_tile(anchor);
+        self.group_add_tile(|g| g.insert_beside(&path, side), tile)
+    }
+
+    /// Inserts `tile` at an edge target of this group. Returns the index.
+    fn insert_tile_at_target(&mut self, target: &EdgeTarget, tile: Tile<W>) -> usize {
+        let target = target.clone();
+        self.group_add_tile(move |g| g.insert_at(&target).unwrap(), tile)
+    }
+
+    /// Removes tile `idx` from the group, leaving its slot vacant if `vacate`.
+    ///
+    /// Dissolves the group if one window is left and there is no vacant slot.
+    fn group_remove_tile(&mut self, idx: usize, vacate: bool) -> (Tile<W>, TileData) {
+        let group = self.group.as_mut().unwrap();
+        let path = group.path_of_tile(idx);
+        let keep = if vacate {
+            group.vacate(&path);
+            true
+        } else {
+            group.remove_slot(&path)
+        };
+        let tile = self.tiles.remove(idx);
+        let data = self.data.remove(idx);
+        if !keep || (self.tiles.len() == 1 && !self.group.as_ref().unwrap().has_vacancy()) {
+            self.dissolve_group();
+        }
+        (tile, data)
+    }
+
+    /// Removes the vacant slot, if any (dissolving the group if one window is left).
+    pub fn clear_vacancy(&mut self) -> bool {
+        let Some(group) = &mut self.group else {
+            return false;
+        };
+        if !group.has_vacancy() {
+            return false;
+        }
+        if !group.clear_vacancy() || self.tiles.len() < 2 {
+            self.dissolve_group();
+            self.update_tile_sizes(true);
+        } else {
+            self.relayout_group();
+        }
+        true
+    }
+
+    /// Puts `tile` into the vacant slot. Returns its index.
+    fn fill_vacancy(&mut self, tile: Tile<W>) -> Option<usize> {
+        let path = self.group.as_mut()?.fill_vacancy()?;
+        Some(self.group_add_tile_at_path(path, tile))
+    }
+
+    fn has_vacancy(&self) -> bool {
+        self.group.as_ref().is_some_and(Group::has_vacancy)
+    }
+
+    /// Rotates the split that tile `idx` is in.
+    fn rotate_split(&mut self, idx: usize) {
+        let group = self.group.as_mut().unwrap();
+        let path = group.path_of_tile(idx);
+        group.rotate(&path[..path.len() - 1]);
+        self.relayout_group();
+    }
+
+    /// Swaps the windows in slots `a` and `b`; the slots stay.
+    fn swap_tiles(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+        self.tiles.swap(a, b);
+        self.data.swap(a, b);
+        if self.active_tile_idx == a {
+            self.active_tile_idx = b;
+        } else if self.active_tile_idx == b {
+            self.active_tile_idx = a;
+        }
+        self.relayout_group();
+    }
+
+    /// The slot next to tile `idx` on `side`, if any.
+    fn group_neighbor(&self, idx: usize, side: Side) -> Option<usize> {
+        let rects = self.group_rects();
+        group::neighbor(&rects, idx, side)
+    }
+
+    fn group_focus(&mut self, side: Side) -> bool {
+        match self.group_neighbor(self.active_tile_idx, side) {
+            Some(idx) => self.activate_idx(idx),
+            None => false,
+        }
+    }
+
+    fn group_move(&mut self, side: Side) -> bool {
+        match self.group_neighbor(self.active_tile_idx, side) {
+            Some(idx) => {
+                self.swap_tiles(self.active_tile_idx, idx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Activates the slot on `edge` nearest to `at` (output y for left/right).
+    fn activate_group_entry(&mut self, edge: Side, at: f64) {
+        let Some(group) = &self.group else {
+            return;
+        };
+        let rects = group.filled_rects();
+        let origin = self.tiles_origin();
+        let at = match edge {
+            Side::Left | Side::Right => at - origin.y,
+            Side::Top | Side::Bottom => at - origin.x,
+        };
+        if let Some(idx) =
+            group::entry_slot(&rects, group.size(), edge, at, Some(self.active_tile_idx))
+        {
+            self.activate_idx(idx);
+        }
+    }
+
+    /// Changes the length of tile `idx`'s child in its nearest `kind` split to `len` px, taking
+    /// the space from (or giving it to) its siblings in proportion to their lengths.
+    fn group_set_len(&mut self, idx: usize, kind: SplitKind, len: f64) -> bool {
+        let gaps = self.options.layout.gaps;
+        let mins = self.group_min_sizes();
+        let group = self.group.as_mut().unwrap();
+        let path = group.path_of_tile(idx);
+        let Some((split, child)) = group.nearest_split(&path, kind) else {
+            return false;
+        };
+        let lens = group.child_lens(&split);
+        let child_mins = group.child_min_lens(&split, gaps, &mins);
+        let total: f64 = lens.iter().sum();
+        let others_min: f64 = child_mins
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != child)
+            .map(|(_, m)| m)
+            .sum();
+        let len = len.clamp(
+            child_mins[child],
+            (total - others_min).max(child_mins[child]),
+        );
+        let others_total: f64 = total - lens[child];
+        let rest = total - len;
+        let new: Vec<f64> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == child {
+                    len
+                } else if others_total > 0. {
+                    l / others_total * rest
+                } else {
+                    rest / (lens.len() - 1) as f64
+                }
+            })
+            .collect();
+        group.set_shares(&split, &new);
+        self.update_group_sizes(
+            true,
+            Transaction::new(),
+            Some(self.options.animations.window_resize.anim),
+        );
+        true
+    }
+
+    /// Current length of tile `idx`'s child in its nearest `kind` split, and the split's total.
+    fn group_len(&self, idx: usize, kind: SplitKind) -> Option<(f64, f64)> {
+        let group = self.group.as_ref()?;
+        let path = group.path_of_tile(idx);
+        let (split, child) = group.nearest_split(&path, kind)?;
+        let lens = group.child_lens(&split);
+        let gaps = self.options.layout.gaps;
+        let total = lens.iter().sum::<f64>() + gaps * (lens.len() - 1) as f64;
+        Some((lens[child], total))
+    }
+
+    /// Inner resize for the window-level size actions.
+    fn group_change_len(&mut self, idx: usize, kind: SplitKind, change: SizeChange) {
+        let Some((current, total)) = self.group_len(idx, kind) else {
+            return;
+        };
+        let gaps = self.options.layout.gaps;
+        let tile = &self.tiles[idx];
+        let full = total + gaps;
+        let window_for_tile = |l: f64| match kind {
+            SplitKind::SideBySide => tile.window_width_for_tile_width(l),
+            SplitKind::Stacked => tile.window_height_for_tile_height(l),
+        };
+        let tile_for_window = |l: f64| match kind {
+            SplitKind::SideBySide => tile.tile_width_for_window_width(l),
+            SplitKind::Stacked => tile.tile_height_for_window_height(l),
+        };
+        let len = match change {
+            SizeChange::SetFixed(px) => tile_for_window(f64::from(px)),
+            SizeChange::SetProportion(p) => full * (p / 100.) - gaps,
+            SizeChange::AdjustFixed(px) => {
+                tile_for_window(window_for_tile(current) + f64::from(px))
+            }
+            SizeChange::AdjustProportion(p) => {
+                let current_p = (current + gaps) / full;
+                full * (current_p + p / 100.) - gaps
+            }
+        };
+        self.group_set_len(idx, kind, len);
+    }
+
+    /// Makes the shares of tile `idx`'s nearest `kind` split equal.
+    fn group_equalize(&mut self, idx: usize, kind: SplitKind) {
+        let group = self.group.as_mut().unwrap();
+        let path = group.path_of_tile(idx);
+        if let Some((split, _)) = group.nearest_split(&path, kind) {
+            let n = group.child_lens(&split).len();
+            group.set_shares(&split, &vec![1.; n]);
+            self.update_group_sizes(
+                true,
+                Transaction::new(),
+                Some(self.options.animations.window_resize.anim),
+            );
+        }
+    }
+
+    /// Cycles tile `idx`'s length in its nearest `kind` split through the preset sizes (column
+    /// width presets for side by side, window height presets for stacked) of the split's length.
+    fn group_toggle_len(&mut self, idx: usize, kind: SplitKind, forwards: bool) {
+        let Some((current, total)) = self.group_len(idx, kind) else {
+            return;
+        };
+        let gaps = self.options.layout.gaps;
+        let presets: Vec<f64> = match kind {
+            SplitKind::SideBySide => &self.options.layout.preset_column_widths,
+            SplitKind::Stacked => &self.options.layout.preset_window_heights,
+        }
+        .iter()
+        .map(|p| match p {
+            PresetSize::Proportion(p) => (total + gaps) * p - gaps,
+            PresetSize::Fixed(px) => f64::from(*px),
+        })
+        .collect();
+        if presets.is_empty() {
+            return;
+        }
+        let next = if forwards {
+            presets
+                .iter()
+                .copied()
+                .find(|p| current + 1. < *p)
+                .unwrap_or(presets[0])
+        } else {
+            presets
+                .iter()
+                .copied()
+                .rev()
+                .find(|p| *p + 1. < current)
+                .unwrap_or(presets[presets.len() - 1])
+        };
+        self.group_set_len(idx, kind, next);
+    }
+
+    /// For an interactive resize of tile `idx` on `side`: the crevice it moves, if that side is
+    /// inside the group (split path, child before the crevice).
+    fn group_crevice(&self, idx: usize, side: Side) -> Option<(group::Path, usize)> {
+        let group = self.group.as_ref()?;
+        let path = group.path_of_tile(idx);
+        match group.edge_target(&path, side) {
+            EdgeTarget::Insert { split, index }
+                if index > 0 && group.child_lens(&split).len() > index =>
+            {
+                Some((split, index - 1))
+            }
+            _ => None,
+        }
+    }
+
+    /// Moves the crevice after child `before` of `split` by `delta`, from the original lengths.
+    fn group_move_crevice(&mut self, split: &[usize], before: usize, orig: &[f64], delta: f64) {
+        let gaps = self.options.layout.gaps;
+        let mins = self.group_min_sizes();
+        let group = self.group.as_mut().unwrap();
+        if group.child_lens(split).len() != orig.len() || before + 1 >= orig.len() {
+            return;
+        }
+        let mins = group.child_min_lens(split, gaps, &mins);
+        let pair = orig[before] + orig[before + 1];
+        let a =
+            (orig[before] + delta).clamp(mins[before], (pair - mins[before + 1]).max(mins[before]));
+        let mut lens = orig.to_vec();
+        lens[before] = a;
+        lens[before + 1] = pair - a;
+        group.set_shares(split, &lens);
+        self.update_group_sizes(false, Transaction::new(), None);
+    }
+
+    /// The ColumnWidth that keeps a window popped out of tile `idx`'s slot at its width.
+    fn width_for_slot(&self, idx: usize) -> (ColumnWidth, bool) {
+        let Some(group) = &self.group else {
+            return (self.width, self.is_full_width);
+        };
+        let rects = group.filled_rects();
+        let w = rects.get(idx).map_or(0., |r| r.size.w);
+        if (w - group.size().w).abs() < 1. {
+            return (self.width, self.is_full_width);
+        }
+        let gaps = self.options.layout.gaps;
+        let full = self.working_area.size.w - gaps;
+        let width = if full > 0. {
+            ColumnWidth::Proportion((w + gaps) / full)
+        } else {
+            ColumnWidth::Fixed(w)
+        };
+        // Snap to a preset if it's close.
+        let width = self
+            .options
+            .layout
+            .preset_column_widths
+            .iter()
+            .map(|p| ColumnWidth::from(*p))
+            .find(|p| (self.resolve_column_width(*p) - w).abs() < 2.)
+            .unwrap_or(width);
+        (width, false)
+    }
+
+    /// Which side of the group a window popped out of tile `idx` goes to: left if its slot touches
+    /// only the group's left edge.
+    fn pop_out_side(&self, idx: usize) -> ScrollDirection {
+        let Some(group) = &self.group else {
+            return ScrollDirection::Right;
+        };
+        let r = group.filled_rects()[idx];
+        let left = r.loc.x <= 0.5;
+        let right = r.loc.x + r.size.w >= group.size().w - 0.5;
+        if left && !right {
+            ScrollDirection::Left
+        } else {
+            ScrollDirection::Right
+        }
+    }
+
+    /// The home to remember for tile `idx` leaving the group to go fullscreen or maximized.
+    fn group_home_for(&self, idx: usize) -> Option<GroupHome<W>> {
+        let group = self.group.as_ref()?;
+        let windows = self.tiles.iter().map(|t| t.window().id().clone()).collect();
+        let path = group.path_of_tile(idx);
+        let (parent, child) = path.split_at(path.len() - 1);
+        let child = child[0];
+        let kind = group.split_kind(parent)?;
+        let n = group.child_lens(parent).len();
+        // A neighbouring window: the first slot of the next sibling, or the last of the previous.
+        let (sibling, side) = if child + 1 < n {
+            let mut p = parent.to_vec();
+            p.push(child + 1);
+            (
+                p,
+                if kind == SplitKind::SideBySide {
+                    Side::Left
+                } else {
+                    Side::Top
+                },
+            )
+        } else {
+            let mut p = parent.to_vec();
+            p.push(child - 1);
+            (
+                p,
+                if kind == SplitKind::SideBySide {
+                    Side::Right
+                } else {
+                    Side::Bottom
+                },
+            )
+        };
+        let anchor_idx = group.filled_before(&sibling);
+        let anchor = self
+            .tiles
+            .get(anchor_idx)
+            .filter(|_| anchor_idx != idx)
+            .map(|t| (t.window().id().clone(), side));
+        Some(GroupHome {
+            tree: group.clone(),
+            windows,
+            index: idx,
+            anchor,
+        })
+    }
+
+    /// Group info for IPC for tile `idx`.
+    fn ipc_group(&self, idx: usize) -> Option<niri_ipc::WindowGroup> {
+        let group = self.group.as_ref()?;
+        let rect = group.filled_rects().get(idx).copied()?;
+        let path = group
+            .path_info(idx)
+            .into_iter()
+            .map(|(kind, index, count, share)| niri_ipc::GroupSplitStep {
+                split: match kind {
+                    SplitKind::SideBySide => niri_ipc::GroupSplit::SideBySide,
+                    SplitKind::Stacked => niri_ipc::GroupSplit::Stacked,
+                },
+                index,
+                count,
+                share,
+            })
+            .collect();
+        Some(niri_ipc::WindowGroup {
+            group_id: group.id(),
+            slot: idx + 1,
+            slot_count: self.tiles.len(),
+            path,
+            pos_in_group: (rect.loc.x, rect.loc.y),
+            size_in_group: (rect.size.w, rect.size.h),
+            group_size: (group.size().w, group.size().h),
+        })
+    }
+
+    #[cfg(test)]
+    fn verify_group_invariants(&self) {
+        let Some(group) = &self.group else {
+            assert!(self.group_home.is_none() || self.tiles.len() == 1);
+            for data in &self.data {
+                assert!(
+                    data.group_rect.is_none(),
+                    "plain columns have no slot rects"
+                );
+            }
+            return;
+        };
+        assert_eq!(
+            group.filled_count(),
+            self.tiles.len(),
+            "one filled slot per tile"
+        );
+        assert!(group.slot_count() >= 2, "a group has at least two slots");
+        assert!(
+            self.tiles.len() >= 2 || group.has_vacancy(),
+            "a group of one window must dissolve"
+        );
+        assert!(matches!(group.root(), group::Node::Split { .. }));
+        assert_eq!(
+            self.display_mode,
+            ColumnDisplay::Normal,
+            "groups are never tabbed"
+        );
+        assert!(!self.is_pending_fullscreen, "groups are never fullscreen");
+        assert!(self.group_home.is_none());
+        fn shares_ok(node: &group::Node) {
+            if let group::Node::Split { children, .. } = node {
+                assert!(
+                    children.len() >= 2 || children.len() == 1,
+                    "splits have children"
+                );
+                let total: f64 = children.iter().map(|c| c.share).sum();
+                assert!((total - 1.).abs() < 1e-6, "shares add up to 1, got {total}");
+                for c in children {
+                    assert!(c.share > 0.);
+                    shares_ok(&c.node);
+                }
+            }
+        }
+        shares_ok(group.root());
+        let rects = group.filled_rects();
+        assert_eq!(rects.len(), self.tiles.len());
+        for (data, rect) in zip(&self.data, rects) {
+            assert_eq!(
+                data.group_rect,
+                Some(rect),
+                "tile slot rects must be up to date"
             );
         }
     }

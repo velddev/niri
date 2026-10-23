@@ -36,13 +36,14 @@ use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
 
+use group::Side;
 use monitor::{InsertHint, InsertPosition, InsertWorkspace, MonitorAddWindowTarget};
 use niri_config::utils::MergeWith as _;
 use niri_config::{
     Config, CornerRadius, LayoutPart, PresetSize, Workspace as WorkspaceConfig, WorkspaceReference,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
-use scrolling::{Column, ColumnWidth};
+use scrolling::{Column, ColumnWidth, MoveOrigin};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
@@ -78,6 +79,7 @@ use crate::window::ResolvedWindowRules;
 pub mod closing_window;
 pub mod floating;
 pub mod focus_ring;
+pub mod group;
 pub mod insert_hint_element;
 pub mod monitor;
 pub mod opening_window;
@@ -445,6 +447,8 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// config overrides for the workspace where the move originated from. As soon as the window
     /// moves over some different workspace though, this override will reset.
     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
+    /// Where the window came from (workspace and place), for a window it gets swapped with.
+    pub(self) origin: Option<(WorkspaceId, MoveOrigin<W::Id>)>,
 }
 
 #[derive(Debug)]
@@ -1133,9 +1137,11 @@ impl<W: LayoutElement> Layout<W> {
                             mon.dnd_scroll_gesture_end();
                         }
 
-                        // Unlock the view on the workspaces.
+                        // Unlock the view on the workspaces, and give up the window's group
+                        // slot.
                         for ws in self.workspaces_mut() {
                             ws.dnd_scroll_gesture_end();
+                            ws.clear_vacancies();
                         }
 
                         return Some(RemovedTile {
@@ -1873,6 +1879,65 @@ impl<W: LayoutElement> Layout<W> {
         monitor.move_up_or_to_workspace_up();
     }
 
+    pub fn split_window(&mut self, window: Option<&W::Id>) {
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            if window.is_none() || window == Some(move_.tile.window().id()) {
+                return;
+            }
+        }
+
+        let workspace = if let Some(window) = window {
+            self.workspaces_mut().find(|ws| ws.has_window(window))
+        } else {
+            self.active_workspace_mut()
+        };
+        if let Some(workspace) = workspace {
+            workspace.split_window(window);
+        }
+    }
+
+    pub fn unsplit_window(&mut self, window: Option<&W::Id>) {
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            if window.is_none() || window == Some(move_.tile.window().id()) {
+                return;
+            }
+        }
+
+        let workspace = if let Some(window) = window {
+            self.workspaces_mut().find(|ws| ws.has_window(window))
+        } else {
+            self.active_workspace_mut()
+        };
+        if let Some(workspace) = workspace {
+            workspace.unsplit_window(window);
+        }
+    }
+
+    /// Puts `window` (or the focused window) next to `target` on `side` as a new group slot.
+    ///
+    /// Both have to be on the same workspace, in the scrolling layout.
+    pub fn split_window_beside(&mut self, window: Option<&W::Id>, target: &W::Id, side: Side) {
+        let window = match window {
+            Some(window) => window.clone(),
+            None => match self.focus() {
+                Some(win) => win.id().clone(),
+                None => return,
+            },
+        };
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            let moving = move_.tile.window().id();
+            if *moving == window || moving == target {
+                return;
+            }
+        }
+        if let Some(ws) = self
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&window) && ws.has_window(target))
+        {
+            ws.split_window_beside(&window, target, side);
+        }
+    }
+
     pub fn consume_or_expel_window_left(&mut self, window: Option<&W::Id>) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
@@ -2391,6 +2456,15 @@ impl<W: LayoutElement> Layout<W> {
         use approx::assert_abs_diff_eq;
 
         let zoom = self.overview_zoom();
+
+        if !matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
+            for ws in self.workspaces() {
+                assert!(
+                    !ws.2.has_vacancy(),
+                    "group slots are only vacant while their window is being dragged"
+                );
+            }
+        }
 
         let mut move_win_id = None;
         if let Some(state) = &self.interactive_move {
@@ -3977,6 +4051,11 @@ impl<W: LayoutElement> Layout<W> {
                 ws.set_fullscreen(window, false);
                 ws.set_maximized(window, false);
 
+                // Remember where the window was, and keep its slot if it's in a group, so it can
+                // be dropped back or swapped with another window.
+                let origin = ws.move_origin(window).map(|origin| (ws.id(), origin));
+                ws.prepare_vacancy(window);
+
                 let RemovedTile {
                     mut tile,
                     width,
@@ -4026,6 +4105,7 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
+                    origin,
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
@@ -4170,6 +4250,11 @@ impl<W: LayoutElement> Layout<W> {
         // Dragging in the overview shouldn't switch the workspace and so on.
         let allow_to_activate_workspace = !self.overview_open;
 
+        // A window swapped out of a group by this drop, to put where the dragged window was.
+        let origin = move_.origin.take();
+        let mut displaced = None;
+        let dropped_id = move_.tile.window().id().clone();
+
         match &mut self.monitor_set {
             MonitorSet::Normal {
                 monitors,
@@ -4278,6 +4363,18 @@ impl<W: LayoutElement> Layout<W> {
                             allow_to_activate_workspace,
                         );
                     }
+                    InsertPosition::GroupEdge(..)
+                    | InsertPosition::GroupSwap(..)
+                    | InsertPosition::GroupVacancy(..) => {
+                        displaced = mon.drop_into_group(
+                            ws_idx,
+                            position,
+                            move_.tile,
+                            move_.width,
+                            move_.is_full_width,
+                            allow_to_activate_workspace,
+                        );
+                    }
                     InsertPosition::Floating => {
                         let tile_render_loc = move_.tile_render_location(zoom);
 
@@ -4358,6 +4455,56 @@ impl<W: LayoutElement> Layout<W> {
                     move_.is_floating,
                 );
             }
+        }
+
+        // The window swapped out of a group goes where the dragged window came from.
+        if let Some(tile) = displaced {
+            self.place_displaced(tile, origin, &dropped_id);
+        }
+
+        // Whatever happened, the dragged window's old slot is resolved now.
+        for ws in self.workspaces_mut() {
+            ws.clear_vacancies();
+        }
+    }
+
+    /// Puts a window swapped out of a group by a drop at the dragged window's origin, or next to
+    /// the dropped window if that's gone.
+    fn place_displaced(
+        &mut self,
+        tile: Tile<W>,
+        origin: Option<(WorkspaceId, MoveOrigin<W::Id>)>,
+        dropped: &W::Id,
+    ) {
+        let mut tile = Some(tile);
+        if let Some((ws_id, origin)) = &origin {
+            for ws in self.workspaces_mut() {
+                // Only one vacancy exists at a time: it can have moved to another workspace.
+                let matches = match origin {
+                    MoveOrigin::Vacancy => ws.has_vacancy(),
+                    _ => ws.id() == *ws_id,
+                };
+                if !matches {
+                    continue;
+                }
+                tile = ws.place_at_origin(tile.take().unwrap(), origin);
+                if tile.is_none() {
+                    return;
+                }
+            }
+        }
+
+        let tile = tile.unwrap();
+        let width = ColumnWidth::Proportion(0.5);
+        if let Some(ws) = self.workspaces_mut().find(|ws| ws.has_window(dropped)) {
+            ws.add_tile(
+                tile,
+                WorkspaceAddWindowTarget::NextTo(dropped),
+                ActivateWindow::No,
+                width,
+                false,
+                false,
+            );
         }
     }
 
@@ -4861,6 +5008,15 @@ impl<W: LayoutElement> Layout<W> {
         let _span = tracy_client::span!("Layout::refresh");
 
         self.is_active = is_active;
+
+        // A group slot is only kept vacant while its window is being dragged.
+        if !matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_))) {
+            for ws in self.workspaces_mut() {
+                if ws.has_vacancy() {
+                    ws.clear_vacancies();
+                }
+            }
+        }
 
         let mut ongoing_scrolling_dnd = self.dnd.is_some().then_some(true);
 

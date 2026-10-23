@@ -16,6 +16,7 @@ use super::*;
 mod animations;
 mod edge_resize;
 mod fullscreen;
+mod groups;
 
 impl<W: LayoutElement> Default for Layout<W> {
     fn default() -> Self {
@@ -401,6 +402,15 @@ fn arbitrary_scroll_direction() -> impl Strategy<Value = ScrollDirection> {
     prop_oneof![Just(ScrollDirection::Left), Just(ScrollDirection::Right)]
 }
 
+fn arbitrary_split_side() -> impl Strategy<Value = group::Side> {
+    prop_oneof![
+        Just(group::Side::Left),
+        Just(group::Side::Right),
+        Just(group::Side::Top),
+        Just(group::Side::Bottom),
+    ]
+}
+
 fn arbitrary_column_display() -> impl Strategy<Value = ColumnDisplay> {
     prop_oneof![Just(ColumnDisplay::Normal), Just(ColumnDisplay::Tabbed)]
 }
@@ -506,6 +516,22 @@ enum Op {
     ConsumeOrExpelWindowRight {
         #[proptest(strategy = "proptest::option::of(1..=5usize)")]
         id: Option<usize>,
+    },
+    SplitWindow {
+        #[proptest(strategy = "proptest::option::of(1..=5usize)")]
+        id: Option<usize>,
+    },
+    UnsplitWindow {
+        #[proptest(strategy = "proptest::option::of(1..=5usize)")]
+        id: Option<usize>,
+    },
+    SplitWindowBeside {
+        #[proptest(strategy = "proptest::option::of(1..=5usize)")]
+        id: Option<usize>,
+        #[proptest(strategy = "1..=5usize")]
+        target: usize,
+        #[proptest(strategy = "arbitrary_split_side()")]
+        side: group::Side,
     },
     ConsumeWindowIntoColumn,
     ExpelWindowFromColumn,
@@ -1168,6 +1194,20 @@ impl Op {
             Op::ConsumeOrExpelWindowRight { id } => {
                 let id = id.filter(|id| layout.has_window(id));
                 layout.consume_or_expel_window_right(id.as_ref());
+            }
+            Op::SplitWindow { id } => {
+                let id = id.filter(|id| layout.has_window(id));
+                layout.split_window(id.as_ref());
+            }
+            Op::UnsplitWindow { id } => {
+                let id = id.filter(|id| layout.has_window(id));
+                layout.unsplit_window(id.as_ref());
+            }
+            Op::SplitWindowBeside { id, target, side } => {
+                let id = id.filter(|id| layout.has_window(id));
+                if layout.has_window(&target) {
+                    layout.split_window_beside(id.as_ref(), &target, side);
+                }
             }
             Op::ConsumeWindowIntoColumn => layout.consume_into_column(),
             Op::ExpelWindowFromColumn => layout.expel_from_column(),

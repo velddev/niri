@@ -447,6 +447,54 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Split the focused window: merge a window alone in its column into a split group with the
+    /// column to its right (at the end of the strip, to its left), or rotate the split of a window
+    /// already in a group between side by side and stacked.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Split the focused window: merge it into a group, or rotate its split")
+    )]
+    SplitWindow {
+        /// Id of the window to split.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Pop the focused window out of its split group into its own column next to the group.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Pop the focused window out of its split group into its own column")
+    )]
+    UnsplitWindow {
+        /// Id of the window to pop out.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Put a window next to another one as a new slot of a split group.
+    ///
+    /// If the target's split already goes that way, the window becomes an equal sibling;
+    /// otherwise the target's slot splits in half. A target alone in its column forms a new
+    /// group.
+    #[cfg_attr(
+        feature = "clap",
+        clap(about = "Put the focused window next to another one in a split group")
+    )]
+    SplitWindowBeside {
+        /// Id of the window to put next to the target.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Id of the window to put it next to.
+        #[cfg_attr(feature = "clap", arg(long))]
+        target: u64,
+        /// Which side of the target.
+        #[cfg_attr(feature = "clap", arg(long, value_enum))]
+        side: SplitSide,
+    },
     /// Consume the window to the right into the focused column.
     ConsumeWindowIntoColumn {},
     /// Expel the bottom window from the focused column.
@@ -1415,6 +1463,78 @@ pub struct WindowLayout {
     /// the distance from the corner of the black backdrop to the corner of the (centered) window
     /// contents.
     pub window_offset_in_tile: (f64, f64),
+    /// The window's slot in a split group, if it is in one.
+    ///
+    /// A split group is a column whose windows sit in a grid of slots (side by side, stacked, or
+    /// nested) instead of on top of each other.
+    #[serde(default)]
+    pub group: Option<WindowGroup>,
+}
+
+/// A window's slot in a split group.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowGroup {
+    /// Id of the group, the same for all its windows.
+    ///
+    /// Unique among the groups that exist; a group that dissolves and forms again may get a new
+    /// id.
+    pub group_id: u64,
+    /// Index of the window's slot, 1-based, in reading order (depth-first through the splits).
+    ///
+    /// The same as the second number of `pos_in_scrolling_layout`.
+    pub slot: usize,
+    /// Number of windows in the group.
+    pub slot_count: usize,
+    /// The splits from the group's root down to this slot.
+    ///
+    /// The windows of a group together describe the whole tree.
+    pub path: Vec<GroupSplitStep>,
+    /// Position of the slot relative to the group's top-left corner, in logical pixels.
+    pub pos_in_group: (f64, f64),
+    /// Size of the slot (the tile's target size), in logical pixels.
+    pub size_in_group: (f64, f64),
+    /// Size of the whole group, in logical pixels.
+    pub group_size: (f64, f64),
+}
+
+/// One split on the way from a group's root to a slot.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct GroupSplitStep {
+    /// How this split arranges its children.
+    pub split: GroupSplit,
+    /// Which child of the split the path goes through, 0-based.
+    pub index: usize,
+    /// Number of children of the split.
+    pub count: usize,
+    /// Share of the split's length that child gets (the shares of a split add up to 1).
+    pub share: f64,
+}
+
+/// How a split in a split group arranges its children.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum GroupSplit {
+    /// Next to each other, left to right.
+    SideBySide,
+    /// On top of each other, top to bottom.
+    Stacked,
+}
+
+/// A side of a window, for putting another window next to it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum SplitSide {
+    /// Left of the target.
+    Left,
+    /// Right of the target.
+    Right,
+    /// Above the target.
+    Up,
+    /// Below the target.
+    Down,
 }
 
 /// Where a window is currently drawn on its output.
@@ -1439,6 +1559,21 @@ pub struct WindowRect {
     pub size: (f64, f64),
     /// Scale the window's workspace is drawn at: 1 normally, the overview zoom in the overview.
     pub scale: f64,
+    /// The split group the window is in, as drawn, if any.
+    #[serde(default)]
+    pub group: Option<WindowRectGroup>,
+}
+
+/// Where a split group is drawn on its output.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowRectGroup {
+    /// Id of the group, as in [`WindowGroup::group_id`].
+    pub group_id: u64,
+    /// Position of the group's top-left corner relative to the output, in logical pixels.
+    pub pos: (f64, f64),
+    /// Size of the group as drawn, in logical pixels (scaled like [`WindowRect::size`]).
+    pub size: (f64, f64),
 }
 
 /// Output configuration change result.

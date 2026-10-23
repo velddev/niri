@@ -10,6 +10,7 @@ use smithay::backend::renderer::element::utils::{
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
+use super::group::Side;
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
 use super::scrolling::{Column, ColumnWidth};
 use super::tile::Tile;
@@ -131,6 +132,12 @@ pub(super) enum InsertPosition {
     NewColumn(usize),
     InColumn(usize, usize),
     Floating,
+    /// An edge of a slot in the group in this column: (column, slot incl. vacant, side).
+    GroupEdge(usize, usize, Side),
+    /// Onto a window in the group in this column: (column, tile).
+    GroupSwap(usize, usize),
+    /// Back into the dragged window's vacant slot in the group in this column.
+    GroupVacancy(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,6 +627,53 @@ impl<W: LayoutElement> Monitor<W> {
         if allow_to_activate_workspace && activate {
             self.activate_workspace(workspace_idx);
         }
+    }
+
+    /// Drops a dragged tile onto a split group position (an edge, a window, or its own vacant
+    /// slot). Returns the window that got swapped out, if any.
+    pub(super) fn drop_into_group(
+        &mut self,
+        workspace_idx: usize,
+        position: InsertPosition,
+        tile: Tile<W>,
+        width: ColumnWidth,
+        is_full_width: bool,
+        allow_to_activate_workspace: bool,
+    ) -> Option<Tile<W>> {
+        let workspace = &mut self.workspaces[workspace_idx];
+        let mut displaced = None;
+        match position {
+            InsertPosition::GroupEdge(column_idx, slot, side) => {
+                workspace.insert_into_group(column_idx, slot, side, tile, true);
+            }
+            InsertPosition::GroupSwap(column_idx, tile_idx) => {
+                displaced = Some(workspace.swap_into_group(column_idx, tile_idx, tile, true));
+            }
+            InsertPosition::GroupVacancy(column_idx) => {
+                if let Some(tile) = workspace.fill_vacancy(column_idx, tile, true) {
+                    workspace.add_tile(
+                        tile,
+                        WorkspaceAddWindowTarget::NewColumnAt(column_idx + 1),
+                        ActivateWindow::Yes,
+                        width,
+                        is_full_width,
+                        false,
+                    );
+                }
+            }
+            _ => unreachable!("not a group drop position"),
+        }
+
+        // After adding a new window, workspace becomes this output's own.
+        if workspace.name().is_none() {
+            workspace.original_output = OutputId::new(&self.output);
+        }
+
+        if allow_to_activate_workspace {
+            self.activate_workspace(workspace_idx);
+        }
+
+        displaced
     }
 
     pub fn clean_up_workspaces(&mut self) {

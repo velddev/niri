@@ -465,19 +465,40 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                     // the overview.
                     let zoom = mon.overview_zoom();
                     for (ws, geo) in mon.workspaces_with_render_geo() {
+                        let groups: Vec<_> = ws
+                            .groups_with_render_rects()
+                            .map(|(id, rect, windows)| {
+                                let loc = geo.loc + rect.loc.upscale(zoom);
+                                let size = rect.size.upscale(zoom);
+                                let windows: Vec<_> =
+                                    windows.iter().map(|w| w.id().get()).collect();
+                                let group = niri_ipc::WindowRectGroup {
+                                    group_id: id,
+                                    pos: (loc.x, loc.y),
+                                    size: (size.w, size.h),
+                                };
+                                (windows, group)
+                            })
+                            .collect();
                         for (tile, pos, visible) in ws.tiles_with_render_positions() {
                             if !visible {
                                 continue;
                             }
                             let loc = geo.loc + pos.upscale(zoom);
                             let size = tile.tile_size().upscale(zoom);
+                            let id = tile.window().id().get();
+                            let group = groups
+                                .iter()
+                                .find(|(windows, _)| windows.contains(&id))
+                                .map(|(_, g)| g.clone());
                             rects.push(niri_ipc::WindowRect {
-                                window_id: tile.window().id().get(),
+                                window_id: id,
                                 workspace_id: ws.id().get(),
                                 output: mon.output_name().clone(),
                                 pos: (loc.x, loc.y),
                                 size: (size.w, size.h),
                                 scale: zoom,
+                                group,
                             });
                         }
                     }
