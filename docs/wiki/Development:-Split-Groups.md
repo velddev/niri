@@ -158,11 +158,25 @@ Everything uses niri's existing animation config: structural changes (merge, rot
 out, dissolve) animate tiles from their old positions with `window-movement`, size changes with
 `window-resize` (the tile resize animation plus a matching move of the slot's position), the view with
 `horizontal-view-movement`.
+
+Moves and resizes run on one timeline, as in a plain column, where windows below a resizing window
+move only once it commits its new size:
+
+- In place (rotate, share changes, the window-level size actions, inserting or removing a window
+  inside the group), a slot that changes size stays where it is drawn until its window commits the new
+  size, then moves with `window-resize` together with its resize, so it never sticks out of the group
+  at its old size. Slots that keep their size (a swap) move at once. Nothing waits longer than the
+  configure's transaction (300 ms): then the slot moves anyway and resizes whenever its window commits.
+- When the group's column moves in the strip too (a merge, a pop-out), every slot moves at once.
+- A merge into the active column (or one that replaces it at the same index) moves the view at once,
+  not only on the windows' commits.
+
 Nothing waits for an animation.
 The layout state changes immediately and animations only render the difference: hit testing, focus,
-drop targets and IPC all use the final geometry, and a new change mid-animation starts from where the
-tile is drawn now (niri's move animations add the current offset), so reversing, e.g. Mod+S twice
-quickly, is instant and continuous.
+drop targets and IPC all use the final geometry (only a held slot is hit where it is held), and a
+new change mid-animation starts from where the tile is drawn now (niri's move animations add the
+current offset), so reversing, e.g. Mod+S twice quickly, is instant and continuous. A second Mod+S
+while a rotate still waits for the commits goes back from the drawn state at once.
 
 ### IPC
 
