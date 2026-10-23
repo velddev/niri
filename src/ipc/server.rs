@@ -637,15 +637,17 @@ impl State {
         server.send_event(event);
     }
 
-    pub fn ipc_refresh_layout(&mut self) {
-        self.ipc_refresh_workspaces();
-        self.ipc_refresh_windows();
-        self.ipc_refresh_overview();
+    /// Sends event-stream events for layout changes. Returns whether there were any.
+    pub fn ipc_refresh_layout(&mut self) -> bool {
+        let mut changed = self.ipc_refresh_workspaces();
+        changed |= self.ipc_refresh_windows();
+        changed |= self.ipc_refresh_overview();
+        changed
     }
 
-    fn ipc_refresh_workspaces(&mut self) {
+    fn ipc_refresh_workspaces(&mut self) -> bool {
         let Some(server) = &self.niri.ipc_server else {
-            return;
+            return false;
         };
 
         let _span = tracy_client::span!("State::ipc_refresh_workspaces");
@@ -736,15 +738,17 @@ impl State {
             events.push(Event::WorkspacesChanged { workspaces });
         }
 
+        let changed = !events.is_empty();
         for event in events {
             state.apply(event.clone());
             server.send_event(event);
         }
+        changed
     }
 
-    fn ipc_refresh_windows(&mut self) {
+    fn ipc_refresh_windows(&mut self) -> bool {
         let Some(server) = &self.niri.ipc_server else {
-            return;
+            return false;
         };
 
         let _span = tracy_client::span!("State::ipc_refresh_windows");
@@ -840,15 +844,17 @@ impl State {
             events.push(Event::WindowFocusChanged { id: None });
         }
 
+        let changed = !events.is_empty();
         for event in events {
             state.apply(event.clone());
             server.send_event(event);
         }
+        changed
     }
 
-    pub fn ipc_refresh_overview(&mut self) {
+    pub fn ipc_refresh_overview(&mut self) -> bool {
         let Some(server) = &self.niri.ipc_server else {
-            return;
+            return false;
         };
 
         let mut state = server.event_stream_state.borrow_mut();
@@ -856,12 +862,13 @@ impl State {
         let is_open = self.niri.layout.is_overview_open();
 
         if state.is_open == is_open {
-            return;
+            return false;
         }
 
         let event = Event::OverviewOpenedOrClosed { is_open };
         state.apply(event.clone());
         server.send_event(event);
+        true
     }
 
     pub fn ipc_refresh_casts(&mut self) {

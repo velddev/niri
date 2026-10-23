@@ -100,16 +100,23 @@ impl ForeignToplevelManagerState {
     }
 }
 
-pub fn refresh(state: &mut State) {
+/// Sends changed toplevels to clients. Returns whether anything changed.
+pub fn refresh(state: &mut State) -> bool {
     let _span = tracy_client::span!("foreign_toplevel::refresh");
 
     let protocol_state = &mut state.niri.foreign_toplevel_state;
+    let mut changed = false;
 
-    // Handle closed windows.
+    // Handle closed windows. Looking up every toplevel in the layout would be quadratic.
+    let mut alive = HashSet::with_capacity(protocol_state.toplevels.len());
+    state.niri.layout.with_windows(|mapped, _, _, _| {
+        alive.insert(mapped.toplevel().wl_surface().clone());
+    });
     protocol_state.toplevels.retain(|surface, data| {
-        if state.niri.layout.find_window_and_output(surface).is_some() {
+        if alive.contains(surface) {
             return true;
         }
+        changed = true;
 
         for instance in data.ext_list_instances.iter() {
             instance.closed();
@@ -139,7 +146,7 @@ pub fn refresh(state: &mut State) {
             if state.niri.keyboard_focus.surface() == Some(wl_surface) {
                 focused = Some((mapped.id(), mapped.window.clone(), output.cloned()));
             } else {
-                refresh_toplevel(
+                changed |= refresh_toplevel(
                     protocol_state,
                     wl_surface,
                     mapped.id(),
@@ -162,7 +169,7 @@ pub fn refresh(state: &mut State) {
                 return;
             };
 
-            refresh_toplevel(
+            changed |= refresh_toplevel(
                 protocol_state,
                 wl_surface,
                 identifier,
@@ -173,6 +180,8 @@ pub fn refresh(state: &mut State) {
             );
         });
     }
+
+    changed
 }
 
 pub fn on_output_bound(state: &mut State, output: &Output, wl_output: &WlOutput) {
@@ -208,7 +217,7 @@ fn refresh_toplevel(
     current: &ToplevelState,
     output: Option<&Output>,
     has_focus: bool,
-) {
+) -> bool {
     let states = to_state_vec(&current.states, has_focus);
 
     match protocol_state.toplevels.entry(wl_surface.clone()) {
@@ -296,6 +305,8 @@ fn refresh_toplevel(
                 // Clean up dead wl_outputs.
                 outputs.retain(|x| x.is_alive());
             }
+
+            something_changed_for_wlr
         }
         Entry::Vacant(entry) => {
             // New window, start tracking it.
@@ -322,6 +333,7 @@ fn refresh_toplevel(
             }
 
             entry.insert(data);
+            true
         }
     }
 }

@@ -5,6 +5,7 @@
 //! surface, and it shows up as `app_menu` in the IPC window info, so a shell can show the
 //! focused window's menu in its own bar. Electron/Chromium and Qt apps use this protocol.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use smithay::reexports::wayland_server::backend::ClientId;
@@ -26,6 +27,14 @@ pub struct AppmenuManagerState;
 struct AppMenuUserData(Mutex<Option<niri_ipc::AppMenu>>);
 
 /// The menu address an app published for this surface, if any.
+/// Counts app menu changes on any surface, so observers can tell when to look again.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The number of app menu changes so far (wrapping).
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
 pub fn app_menu(surface: &WlSurface) -> Option<niri_ipc::AppMenu> {
     with_states(surface, |states| {
         states
@@ -36,6 +45,7 @@ pub fn app_menu(surface: &WlSurface) -> Option<niri_ipc::AppMenu> {
 }
 
 fn set_app_menu(surface: &WlSurface, menu: Option<niri_ipc::AppMenu>) {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
     if !surface.is_alive() {
         return;
     }

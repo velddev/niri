@@ -20,8 +20,9 @@ use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, Stream
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::{RenderCtx, RenderTarget};
-use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
+use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId, ChangeTracked};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
+use crate::window::Mapped;
 
 mod pw_utils;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
@@ -34,8 +35,11 @@ pub struct Screencasting {
 
     pub pw_to_niri: calloop::channel::Sender<PwToNiri>,
 
-    /// Screencast output for each mapped window.
+    /// Screencast output for each mapped window, kept while there are casts.
     pub mapped_cast_output: HashMap<Window, Output>,
+
+    /// Whether some windows may still have their window-cast-target flag set.
+    pub window_cast_targets_set: bool,
 
     /// Window ID for the "dynamic cast" special window for the xdp-gnome picker.
     pub dynamic_cast_id_for_portal: MappedId,
@@ -70,6 +74,7 @@ impl Screencasting {
             pending_dynamic_casts: vec![],
             pw_to_niri,
             mapped_cast_output: HashMap::new(),
+            window_cast_targets_set: false,
             dynamic_cast_id_for_portal: MappedId::next(),
             pipewire: None,
         }
@@ -179,9 +184,10 @@ impl State {
 
             // Use the cached output since it will be present even if the output was
             // currently disconnected.
-            let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.window) else {
+            let Some(output) = self.niri.cast_output_for_window(mapped) else {
                 break;
             };
+            let output = &output;
 
             let scale = Scale::from(output.current_scale().fractional_scale());
             let bbox = mapped
@@ -270,7 +276,7 @@ impl State {
             CastTarget::Window { id } => {
                 let mut windows = self.niri.layout.windows();
                 if let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == *id) {
-                    if let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.window) {
+                    if let Some(output) = self.niri.cast_output_for_window(mapped) {
                         refresh = Some(output.current_mode().unwrap().refresh as u32);
                     }
                 }
@@ -468,9 +474,28 @@ impl State {
 }
 
 impl Niri {
+    /// The output to cast a window at: the one it was last on while there were casts, or else
+    /// the one it's on now.
+    fn cast_output_for_window(&self, mapped: &Mapped) -> Option<Output> {
+        if let Some(output) = self.casting.mapped_cast_output.get(&mapped.window) {
+            return Some(output.clone());
+        }
+        let (_, output) = self
+            .layout
+            .find_window_and_output(mapped.toplevel().wl_surface())?;
+        output.cloned()
+    }
+
     pub fn refresh_mapped_cast_window_rules(&mut self) {
-        // O(N^2) but should be fine since there aren't many casts usually.
-        self.layout.with_windows_mut(|mapped, _| {
+        // Nothing to do without casts once every window knows it's no longer a target.
+        if self.casting.casts.is_empty() && !self.casting.window_cast_targets_set {
+            return;
+        }
+        self.casting.window_cast_targets_set = !self.casting.casts.is_empty();
+
+        // O(N^2) but should be fine since there aren't many casts usually. A change in the
+        // target flag recomputes the window rules, which counts as a layout change then.
+        ChangeTracked::untracked_mut(&mut self.layout).with_windows_mut(|mapped, _| {
             let id = mapped.id().get();
             // Find regardless of cast.is_active.
             let value = self
@@ -483,6 +508,15 @@ impl Niri {
     }
 
     pub fn refresh_mapped_cast_outputs(&mut self) {
+        // Without casts, nobody needs the outputs; cast_output_for_window() fills in for
+        // a cast that starts before this runs again.
+        if self.casting.casts.is_empty() {
+            if !self.casting.mapped_cast_output.is_empty() {
+                self.casting.mapped_cast_output.clear();
+            }
+            return;
+        }
+
         let mut seen = HashSet::new();
         let mut output_changed = vec![];
 
@@ -775,7 +809,7 @@ impl Niri {
             .layout
             .windows()
             .find(|(_, m)| m.id().get() == window_id)?;
-        let output = self.casting.mapped_cast_output.get(&mapped.window)?;
+        let output = self.cast_output_for_window(mapped)?;
         let scale = Scale::from(output.current_scale().fractional_scale());
         let bbox = mapped
             .window

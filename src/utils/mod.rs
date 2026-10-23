@@ -48,6 +48,60 @@ pub mod xwayland;
 
 pub static IS_SYSTEMD_SERVICE: AtomicBool = AtomicBool::new(false);
 
+/// A value that counts its mutable accesses: a cheap, conservative "may have changed" signal.
+///
+/// Every `&mut` access through `DerefMut` (including method calls that take `&mut self`)
+/// increments the generation, so code that only needs to know whether anything could have
+/// changed since it last looked compares generations instead of walking the value. Hot paths that
+/// mutate parts nobody observes this way (rendering, animation ticks) use
+/// [`ChangeTracked::untracked_mut`] and bump the generation themselves when it matters.
+#[derive(Debug)]
+pub struct ChangeTracked<T> {
+    value: T,
+    generation: u64,
+}
+
+impl<T> ChangeTracked<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            generation: 0,
+        }
+    }
+
+    /// The number of mutable accesses so far (wrapping).
+    pub fn generation(this: &Self) -> u64 {
+        this.generation
+    }
+
+    /// Marks the value as changed.
+    pub fn bump(this: &mut Self) {
+        this.generation = this.generation.wrapping_add(1);
+    }
+
+    /// Mutable access that doesn't count as a change.
+    ///
+    /// Only for code that changes nothing that generation-gated observers look at.
+    pub fn untracked_mut(this: &mut Self) -> &mut T {
+        &mut this.value
+    }
+}
+
+impl<T> std::ops::Deref for ChangeTracked<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for ChangeTracked<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.generation = self.generation.wrapping_add(1);
+        &mut self.value
+    }
+}
+
 use id::IdCounter;
 
 /// Unique ID for a screencast session.

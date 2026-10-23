@@ -181,7 +181,7 @@ use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland, ResizeEdge,
+    send_scale_transform, write_png_rgba8, xwayland, ChangeTracked, ResizeEdge,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -228,7 +228,13 @@ pub struct Niri {
 
     // Each workspace corresponds to a Space. Each workspace generally has one Output mapped to it,
     // however it may have none (when there are no outputs connected) or multiple (when mirroring).
-    pub layout: Layout<Mapped>,
+    ///
+    /// Mutable accesses are counted, see [`Niri::observer_generation`].
+    pub layout: ChangeTracked<Layout<Mapped>>,
+    /// Changes to what the per-iteration observers look at, outside of the layout.
+    observer_changes: u64,
+    /// The generation each observer last ran at.
+    observer_gate: ObserverGate,
 
     // This space does not actually contain any windows, but all outputs are mapped into it
     // according to their global position.
@@ -577,6 +583,34 @@ struct SurfaceFrameThrottlingState {
     last_sent_at: RefCell<Option<(Output, u32)>>,
 }
 
+/// The generation (see [`Niri::observer_generation`]) at which each observer last ran.
+///
+/// The foreign-toplevel and ext-workspace protocols and the IPC event stream compare niri's
+/// windows, workspaces and focus against what they last sent, on every event loop iteration.
+/// That walk is skipped while nothing it looks at can have changed.
+#[derive(Debug, Default)]
+struct ObserverGate {
+    foreign_toplevel: Option<u64>,
+    ext_workspace: Option<u64>,
+    ipc_layout: Option<u64>,
+}
+
+/// With `NIRI_DEBUG_OBSERVER_GATE=1` (and always in tests), observers run on every iteration
+/// anyway, and an error is logged (a panic in tests) whenever one that the gate would have
+/// skipped found a change.
+fn debug_observer_gate() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test)
+        || *VALUE.get_or_init(|| env::var_os("NIRI_DEBUG_OBSERVER_GATE").is_some_and(|v| v == "1"))
+}
+
+fn observer_gate_missed(observer: &str) {
+    if cfg!(test) {
+        panic!("observer gate skipped a change: {observer}");
+    }
+    error!("observer gate skipped a change: {observer}");
+}
+
 /// When a frame callback was last sent to a surface of a visible, unfocused window.
 #[derive(Default)]
 struct UnfocusedFrameCapState {
@@ -870,8 +904,23 @@ impl State {
         self.niri.global_space.refresh();
         self.niri.refresh_idle_inhibit();
         self.refresh_pointer_contents();
-        foreign_toplevel::refresh(self);
-        ext_workspace::refresh(self);
+
+        // Observers of the layout, focus and toplevels: skip them while nothing they look at has
+        // changed since they last ran.
+        let debug_gate = debug_observer_gate();
+        let generation = self.niri.observer_generation();
+        if self.niri.observer_gate.foreign_toplevel != Some(generation) {
+            foreign_toplevel::refresh(self);
+            self.niri.observer_gate.foreign_toplevel = Some(generation);
+        } else if debug_gate && foreign_toplevel::refresh(self) {
+            observer_gate_missed("foreign-toplevel");
+        }
+        if self.niri.observer_gate.ext_workspace != Some(generation) {
+            ext_workspace::refresh(self);
+            self.niri.observer_gate.ext_workspace = Some(generation);
+        } else if debug_gate && ext_workspace::refresh(self) {
+            observer_gate_missed("ext-workspace");
+        }
 
         #[cfg(feature = "xdp-gnome-screencast")]
         self.niri.refresh_mapped_cast_outputs();
@@ -883,7 +932,13 @@ impl State {
 
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
-        self.ipc_refresh_layout();
+        let generation = self.niri.observer_generation();
+        if self.niri.observer_gate.ipc_layout != Some(generation) {
+            self.ipc_refresh_layout();
+            self.niri.observer_gate.ipc_layout = Some(generation);
+        } else if debug_gate && self.ipc_refresh_layout() {
+            observer_gate_missed("IPC layout");
+        }
         self.ipc_refresh_keyboard_layout_index();
 
         // Needs to be called after updating the keyboard focus.
@@ -1333,6 +1388,7 @@ impl State {
 
         let keyboard = self.niri.seat.get_keyboard().unwrap();
         if self.niri.keyboard_focus != focus {
+            self.niri.observers_changed();
             trace!(
                 "keyboard focus changed from {:?} to {:?}",
                 self.niri.keyboard_focus,
@@ -2586,7 +2642,9 @@ impl Niri {
             is_at_startup: true,
             clock: animation_clock,
 
-            layout,
+            layout: ChangeTracked::new(layout),
+            observer_changes: 0,
+            observer_gate: ObserverGate::default(),
             global_space: Space::default(),
             sorted_outputs: Vec::default(),
             output_state: HashMap::new(),
@@ -2818,6 +2876,8 @@ impl Niri {
             outputs.iter().map(|d| &d.name.connector)
         );
 
+        // ext-workspace sends workspace groups by output.
+        self.observers_changed();
         self.sorted_outputs = outputs
             .iter()
             .map(|Data { output, .. }| output.clone())
@@ -4103,7 +4163,8 @@ impl Niri {
             KeyboardFocus::Mru => true,
         };
 
-        self.layout.refresh(layout_is_active);
+        // Only updates state derived from changes that were counted when they were made.
+        ChangeTracked::untracked_mut(&mut self.layout).refresh(layout_is_active);
     }
 
     pub fn refresh_idle_inhibit(&mut self) {
@@ -4123,8 +4184,9 @@ impl Niri {
     pub fn refresh_window_states(&mut self) {
         let _span = tracy_client::span!("Niri::refresh_window_states");
 
+        // The tiled state reaches observers only once the client commits it.
         let config = self.config.borrow();
-        self.layout.with_windows_mut(|mapped, _output| {
+        ChangeTracked::untracked_mut(&mut self.layout).with_windows_mut(|mapped, _output| {
             mapped.update_tiled_state(config.prefer_no_csd);
         });
         drop(config);
@@ -4138,7 +4200,9 @@ impl Niri {
 
         let mut windows = vec![];
         let mut outputs = HashSet::new();
-        self.layout.with_windows_mut(|mapped, output| {
+        // Windows whose rules changed go through update_window() below, which counts as a change.
+        let layout = ChangeTracked::untracked_mut(&mut self.layout);
+        layout.with_windows_mut(|mapped, output| {
             if mapped.recompute_window_rules_if_needed(window_rules, self.is_at_startup) {
                 windows.push(mapped.window.clone());
 
@@ -4165,10 +4229,30 @@ impl Niri {
         }
     }
 
+    /// A number that changes whenever anything the per-iteration observers look at may have
+    /// changed: the layout (any mutable access), keyboard focus, toplevel titles, app ids and
+    /// states, app menus.
+    pub fn observer_generation(&self) -> u64 {
+        ChangeTracked::generation(&self.layout)
+            .wrapping_add(self.observer_changes)
+            .wrapping_add(crate::protocols::appmenu::generation())
+    }
+
+    /// Marks that something the per-iteration observers look at changed outside of the layout.
+    pub fn observers_changed(&mut self) {
+        self.observer_changes = self.observer_changes.wrapping_add(1);
+    }
+
     pub fn advance_animations(&mut self) {
         let _span = tracy_client::span!("Niri::advance_animations");
 
-        self.layout.advance_animations();
+        // Advancing animations changes the layout only while something is animating, or right
+        // after, when finished animations get cleaned up.
+        if self.layout.are_transitions_ongoing() {
+            self.layout.advance_animations();
+        } else {
+            ChangeTracked::untracked_mut(&mut self.layout).advance_animations();
+        }
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
@@ -4185,7 +4269,7 @@ impl Niri {
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
         self.update_xray_render_elements(output);
-        self.layout.update_render_elements(output);
+        ChangeTracked::untracked_mut(&mut self.layout).update_render_elements(output);
 
         for (out, state) in self.output_state.iter_mut() {
             if output.is_none_or(|output| out == output) {
@@ -5225,7 +5309,8 @@ impl Niri {
             }
         };
 
-        for mapped in self.layout.windows_for_output_mut(output) {
+        for mapped in ChangeTracked::untracked_mut(&mut self.layout).windows_for_output_mut(output)
+        {
             let rules = mapped.rules();
             if rules.frame_callbacks_when_hidden == Some(true) {
                 mapped.send_frame(

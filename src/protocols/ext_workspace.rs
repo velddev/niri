@@ -81,7 +81,8 @@ pub struct ExtWorkspaceGlobalData {
     filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
 }
 
-pub fn refresh(state: &mut State) {
+/// Sends changed workspaces to clients. Returns whether anything changed.
+pub fn refresh(state: &mut State) -> bool {
     let _span = tracy_client::span!("ext_workspace::refresh");
 
     let protocol_state = &mut state.niri.ext_workspace_state;
@@ -146,6 +147,8 @@ pub fn refresh(state: &mut State) {
             manager.done();
         }
     }
+
+    changed
 }
 
 pub fn on_output_bound(state: &mut State, output: &Output, wl_output: &WlOutput) {

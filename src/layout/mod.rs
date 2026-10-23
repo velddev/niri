@@ -2857,6 +2857,19 @@ impl<W: LayoutElement> Layout<W> {
         false
     }
 
+    /// Whether advancing animations may change anything: an animation or gesture is ongoing, or
+    /// a finished one hasn't been cleaned up yet.
+    pub fn are_transitions_ongoing(&self) -> bool {
+        self.dnd.is_some()
+            || self.interactive_move.is_some()
+            || self.overview_progress.is_some()
+            || self.are_animations_ongoing(None)
+            || self.monitors().any(|mon| mon.are_transitions_ongoing())
+            || self
+                .workspaces()
+                .any(|(_, _, ws)| ws.are_transitions_ongoing())
+    }
+
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
         let _span = tracy_client::span!("Layout::update_render_elements");
 
