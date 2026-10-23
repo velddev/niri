@@ -77,6 +77,8 @@ pub struct WindowRule {
     pub tiled_state: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub frame_callbacks_when_hidden: Option<bool>,
+    #[knuffel(child, unwrap(argument))]
+    pub unfocused_frame_rate: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, default)]
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]

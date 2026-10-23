@@ -124,6 +124,11 @@ pub struct ResolvedWindowRules {
     /// not visible (on another workspace, scrolled out of view).
     pub frame_callbacks_when_hidden: Option<bool>,
 
+    /// Highest rate of frame callbacks while the window is visible but not focused, in Hz.
+    ///
+    /// `None` means the default cap (half the output refresh rate), `Some(0.)` means no cap.
+    pub unfocused_frame_rate: Option<f64>,
+
     /// Background effect configuration.
     pub background_effect: BackgroundEffect,
 
@@ -308,6 +313,9 @@ impl ResolvedWindowRules {
                 }
                 if let Some(x) = rule.frame_callbacks_when_hidden {
                     resolved.frame_callbacks_when_hidden = Some(x);
+                }
+                if let Some(x) = rule.unfocused_frame_rate {
+                    resolved.unfocused_frame_rate = Some(x.0);
                 }
 
                 resolved

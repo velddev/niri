@@ -59,6 +59,7 @@ window-rule {
     default-floating-position x=100 y=200 relative-to="bottom-left"
     scroll-factor 0.75
     frame-callbacks-when-hidden true
+    unfocused-frame-rate 0
 
     focus-ring {
         // off
@@ -652,6 +653,35 @@ window-rule {
     match app-id="^niri$"
 
     frame-callbacks-when-hidden true
+}
+```
+
+#### `unfocused-frame-rate`
+
+Visible windows that are neither focused nor fullscreen get frame callbacks at a capped rate: by default half their output's refresh rate (72 Hz on a 144 Hz monitor).
+Clients that draw in response to frame callbacks (browsers, Electron apps, games, video players) then draw and commit at that rate while you work in another window, which saves CPU in the client and in niri.
+The window that has focus, or would have it when a layer-shell surface like a launcher has taken the keyboard, is never capped.
+
+This property sets the cap for matched windows in Hz.
+Set it to `0` to turn the cap off, so the window gets a frame callback on every refresh cycle, as it would when focused.
+A value at or above the refresh rate also means no cap.
+
+Capped windows get their frame callbacks on the same refresh cycles, so niri redraws for all of them together.
+Keep in mind that a screencast of a single unfocused window runs at the capped rate too, and that video playing in an unfocused window shows its frames on the capped rate's ticks.
+
+```kdl
+// Keep picture-in-picture video at the full refresh rate.
+window-rule {
+    match title="^Picture-in-picture$"
+
+    unfocused-frame-rate 0
+}
+
+// Let unfocused browsers draw at 30 Hz.
+window-rule {
+    match app-id="^firefox$"
+
+    unfocused-frame-rate 30
 }
 ```
 

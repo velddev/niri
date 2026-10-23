@@ -74,7 +74,7 @@ use smithay::utils::{
 use smithay::wayland::background_effect::BackgroundEffectState;
 use smithay::wayland::compositor::{
     with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
-    CompositorState, HookId, SurfaceData, TraversalAction,
+    CompositorState, HookId, SurfaceAttributes, SurfaceData, TraversalAction,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::DmabufState;
@@ -488,6 +488,9 @@ pub struct OutputState {
     screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// Timer (and when it fires) to send the frame callbacks that the unfocused-window cap held
+    /// back, in case nothing else sends frame callbacks on this output by then.
+    unfocused_fc_timer: Option<(Duration, RegistrationToken)>,
 }
 
 #[derive(Debug, Default)]
@@ -572,6 +575,52 @@ pub enum LockRenderState {
 struct SurfaceFrameThrottlingState {
     /// Output and sequence that the frame callback was last sent at.
     last_sent_at: RefCell<Option<(Output, u32)>>,
+}
+
+/// When a frame callback was last sent to a surface of a visible, unfocused window.
+#[derive(Default)]
+struct UnfocusedFrameCapState {
+    last_sent_at: Cell<Option<Duration>>,
+}
+
+/// The frame callback cap for visible windows that are neither focused nor fullscreen.
+///
+/// Capped surfaces get a frame callback at most once per `interval`, on the first refresh cycle
+/// after each multiple of `interval` (in monotonic time), so all capped surfaces on an output
+/// commit in the same refresh cycles and niri redraws for them together.
+#[derive(Debug, Clone, Copy)]
+struct UnfocusedFrameCap {
+    interval: Duration,
+    refresh: Duration,
+}
+
+impl UnfocusedFrameCap {
+    /// The cap for a window on an output, or `None` when it runs uncapped.
+    ///
+    /// `rate` is the window's `unfocused-frame-rate` rule: `None` for the default of half the
+    /// refresh rate, `Some(0.)` for no cap.
+    fn new(refresh: Option<Duration>, rate: Option<f64>) -> Option<Self> {
+        let refresh = refresh?;
+        let interval = match rate {
+            None => refresh * 2,
+            Some(hz) if hz <= 0. => return None,
+            Some(hz) => Duration::from_secs_f64(1. / hz),
+        };
+        // A cap at or above the refresh rate would change nothing.
+        if interval.as_nanos() * 100 <= refresh.as_nanos() * 105 {
+            return None;
+        }
+        Some(Self { interval, refresh })
+    }
+
+    /// When a surface last sent a callback at `last` may get the next one.
+    fn next_allowed(&self, last: Duration) -> Duration {
+        let n = self.interval.as_nanos();
+        let next_tick = Duration::from_nanos(((last.as_nanos() / n + 1) * n) as u64);
+        // Half a refresh cycle of slack keeps a surface on the refresh cycles it settled on when
+        // the ticks fall close to them, instead of alternating between one and three cycles.
+        next_tick.max(last + self.interval - self.refresh / 2)
+    }
 }
 
 pub enum CenterCoords {
@@ -2917,6 +2966,7 @@ impl Niri {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            unfocused_fc_timer: None,
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -5128,13 +5178,80 @@ impl Niri {
 
         let frame_callback_time = get_monotonic_time();
 
+        // Visible windows that are neither focused nor fullscreen get frame callbacks at a capped
+        // rate (by default half the refresh rate): their clients draw and commit less often, for
+        // a fraction of the CPU, and niri redraws for them less often.
+        let refresh = state.frame_clock.refresh_interval();
+        let layout_focus = self.layout.focus().map(|mapped| mapped.id());
+        // The earliest time a held-back surface may get its callback.
+        let next_capped = Cell::new(None::<Duration>);
+        let should_send_capped = |cap: UnfocusedFrameCap| {
+            let next_capped = &next_capped;
+            let should_send = &should_send;
+            move |surface: &WlSurface, states: &SurfaceData| {
+                let current_primary_output = surface_primary_scanout_output(surface, states);
+                if current_primary_output.as_ref() != Some(output) {
+                    return None;
+                }
+
+                // Only hold back surfaces that wait for a callback.
+                let waiting = !states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .frame_callbacks
+                    .is_empty();
+                if !waiting {
+                    return should_send(surface, states);
+                }
+
+                let cap_state = states
+                    .data_map
+                    .get_or_insert(UnfocusedFrameCapState::default);
+                if let Some(last) = cap_state.last_sent_at.get() {
+                    let next = cap.next_allowed(last);
+                    if frame_callback_time < next {
+                        let earliest = next_capped.get().map_or(next, |x: Duration| x.min(next));
+                        next_capped.set(Some(earliest));
+                        return None;
+                    }
+                }
+
+                let rv = should_send(surface, states);
+                if rv.is_some() {
+                    cap_state.last_sent_at.set(Some(frame_callback_time));
+                }
+                rv
+            }
+        };
+
         for mapped in self.layout.windows_for_output_mut(output) {
-            if mapped.rules().frame_callbacks_when_hidden == Some(true) {
+            let rules = mapped.rules();
+            if rules.frame_callbacks_when_hidden == Some(true) {
                 mapped.send_frame(
                     output,
                     frame_callback_time,
                     FRAME_CALLBACK_THROTTLE,
                     should_send_hidden,
+                );
+                continue;
+            }
+
+            let cap = if mapped.is_focused()
+                || Some(mapped.id()) == layout_focus
+                || mapped.sizing_mode().is_fullscreen()
+            {
+                None
+            } else {
+                UnfocusedFrameCap::new(refresh, rules.unfocused_frame_rate)
+            };
+
+            if let Some(cap) = cap {
+                mapped.send_frame(
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send_capped(cap),
                 );
             } else {
                 mapped.send_frame(
@@ -5184,6 +5301,49 @@ impl Niri {
                 should_send,
             );
         }
+
+        if let Some(next) = next_capped.get() {
+            // Otherwise a redraw or a VBlank is coming, and with it the next frame callbacks.
+            if matches!(self.output_state[output].redraw_state, RedrawState::Idle) {
+                self.schedule_unfocused_frame_callbacks(output, next);
+            }
+        }
+    }
+
+    /// Makes sure that the surfaces that the unfocused-window cap held back get their frame
+    /// callbacks at `due` (monotonic time), even if this output has nothing to redraw by then.
+    fn schedule_unfocused_frame_callbacks(&mut self, output: &Output, due: Duration) {
+        let Some(state) = self.output_state.get_mut(output) else {
+            return;
+        };
+        // A little late rather than early, so the surfaces are due when it fires.
+        let due = due + Duration::from_micros(300);
+        if let Some((pending, token)) = state.unfocused_fc_timer {
+            if pending <= due {
+                return;
+            }
+            self.event_loop.remove(token);
+        }
+
+        let delay = due
+            .saturating_sub(get_monotonic_time())
+            .max(Duration::from_millis(1));
+        let output = output.clone();
+        let token = self
+            .event_loop
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                let niri = &mut state.niri;
+                if let Some(output_state) = niri.output_state.get_mut(&output) {
+                    output_state.unfocused_fc_timer = None;
+                    // Otherwise a redraw or a VBlank is coming, and frame callbacks with it.
+                    if matches!(output_state.redraw_state, RedrawState::Idle) {
+                        niri.send_frame_callbacks(&output);
+                    }
+                }
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        state.unfocused_fc_timer = Some((due, token));
     }
 
     pub fn send_frame_callbacks_on_fallback_timer(&mut self) {
@@ -6672,5 +6832,71 @@ niri_render_elements! {
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
+    }
+}
+
+#[cfg(test)]
+mod unfocused_frame_cap_tests {
+    use super::*;
+
+    const REFRESH_144: Duration = Duration::from_nanos(6_944_444);
+
+    /// Simulates refresh cycles with some jitter and returns the cycles a capped surface that
+    /// always waits for a callback gets one on.
+    fn sent_cycles(cap: UnfocusedFrameCap, phase: Duration, cycles: u32) -> Vec<u32> {
+        let mut last = None;
+        let mut sent = vec![];
+        let mut rng = 12345u64;
+        for i in 0..cycles {
+            // Up to ±0.15 ms of pseudo-random jitter.
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let jitter_us = (rng >> 33) % 301;
+            let now =
+                phase + REFRESH_144 * i + Duration::from_secs(1) + Duration::from_micros(jitter_us)
+                    - Duration::from_micros(150);
+            if last.is_none_or(|last| now >= cap.next_allowed(last)) {
+                last = Some(now);
+                sent.push(i);
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn default_cap_is_every_other_cycle() {
+        let cap = UnfocusedFrameCap::new(Some(REFRESH_144), None).unwrap();
+        // Whatever the phase of the refresh cycles against the ticks, the surface settles on
+        // every other cycle instead of alternating between one and three: after the first few
+        // cycles, never one cycle apart, and three apart at most once (when it moves off a
+        // tick it sat right on).
+        for phase_us in (0..14_000).step_by(250) {
+            let sent = sent_cycles(cap, Duration::from_micros(phase_us), 400);
+            let gaps: Vec<_> = sent.windows(2).map(|w| w[1] - w[0]).collect();
+            let settled = &gaps[5..];
+            assert!(
+                settled.iter().all(|&gap| gap == 2 || gap == 3)
+                    && settled.iter().filter(|&&gap| gap == 3).count() <= 1,
+                "phase {phase_us} us: gaps {gaps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_sets_or_turns_off_the_cap() {
+        assert!(UnfocusedFrameCap::new(None, None).is_none());
+        assert!(UnfocusedFrameCap::new(Some(REFRESH_144), Some(0.)).is_none());
+        assert!(UnfocusedFrameCap::new(Some(REFRESH_144), Some(144.)).is_none());
+        assert!(UnfocusedFrameCap::new(Some(REFRESH_144), Some(240.)).is_none());
+
+        let cap = UnfocusedFrameCap::new(Some(REFRESH_144), Some(36.)).unwrap();
+        let sent = sent_cycles(cap, Duration::ZERO, 1440);
+        // 10 s at 144 Hz.
+        assert!(
+            (355..=361).contains(&sent.len()),
+            "{} callbacks",
+            sent.len()
+        );
     }
 }
