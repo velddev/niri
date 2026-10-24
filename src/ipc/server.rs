@@ -35,7 +35,7 @@ use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
 use crate::protocols::appmenu;
-use crate::utils::{version, with_toplevel_role};
+use crate::utils::{version, with_toplevel_role, SlowDispatchGuard};
 use crate::window::Mapped;
 
 // If an event stream client fails to read events fast enough that we accumulate more than this
@@ -91,6 +91,7 @@ impl IpcServer {
             let source = Generic::new(listener, Interest::READ, Mode::Level);
             event_loop
                 .insert_source(source, |_, socket, state| {
+                    let _slow = SlowDispatchGuard::new("new IPC client");
                     match socket.accept() {
                         Ok((stream, _)) => on_new_ipc_client(state, stream),
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
@@ -386,6 +387,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 
             let action = niri_config::Action::from(action);
             ctx.event_loop.insert_idle(move |state| {
+                let _slow = SlowDispatchGuard::new("IPC action");
                 // Make sure some logic like workspace clean-up has a chance to run before doing
                 // actions.
                 state.niri.advance_animations();
@@ -637,15 +639,17 @@ impl State {
         server.send_event(event);
     }
 
-    pub fn ipc_refresh_layout(&mut self) {
-        self.ipc_refresh_workspaces();
-        self.ipc_refresh_windows();
-        self.ipc_refresh_overview();
+    /// Sends event-stream events for layout changes. Returns whether there were any.
+    pub fn ipc_refresh_layout(&mut self) -> bool {
+        let mut changed = self.ipc_refresh_workspaces();
+        changed |= self.ipc_refresh_windows();
+        changed |= self.ipc_refresh_overview();
+        changed
     }
 
-    fn ipc_refresh_workspaces(&mut self) {
+    fn ipc_refresh_workspaces(&mut self) -> bool {
         let Some(server) = &self.niri.ipc_server else {
-            return;
+            return false;
         };
 
         let _span = tracy_client::span!("State::ipc_refresh_workspaces");
@@ -736,15 +740,17 @@ impl State {
             events.push(Event::WorkspacesChanged { workspaces });
         }
 
+        let changed = !events.is_empty();
         for event in events {
             state.apply(event.clone());
             server.send_event(event);
         }
+        changed
     }
 
-    fn ipc_refresh_windows(&mut self) {
+    fn ipc_refresh_windows(&mut self) -> bool {
         let Some(server) = &self.niri.ipc_server else {
-            return;
+            return false;
         };
 
         let _span = tracy_client::span!("State::ipc_refresh_windows");
@@ -840,15 +846,17 @@ impl State {
             events.push(Event::WindowFocusChanged { id: None });
         }
 
+        let changed = !events.is_empty();
         for event in events {
             state.apply(event.clone());
             server.send_event(event);
         }
+        changed
     }
 
-    pub fn ipc_refresh_overview(&mut self) {
+    pub fn ipc_refresh_overview(&mut self) -> bool {
         let Some(server) = &self.niri.ipc_server else {
-            return;
+            return false;
         };
 
         let mut state = server.event_stream_state.borrow_mut();
@@ -856,12 +864,13 @@ impl State {
         let is_open = self.niri.layout.is_overview_open();
 
         if state.is_open == is_open {
-            return;
+            return false;
         }
 
         let event = Event::OverviewOpenedOrClosed { is_open };
         state.apply(event.clone());
         server.send_event(event);
+        true
     }
 
     pub fn ipc_refresh_casts(&mut self) {

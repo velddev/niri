@@ -68,7 +68,9 @@ use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
-use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
+use crate::utils::{
+    get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation, SlowDispatchGuard,
+};
 
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 4] = [
     Fourcc::Xrgb8888,
@@ -424,6 +426,7 @@ impl Tty {
         let udev_backend =
             UdevBackend::new(session.seat()).context("error creating a udev backend")?;
         let udev_dispatcher = Dispatcher::new(udev_backend, move |event, _, state: &mut State| {
+            let _slow = SlowDispatchGuard::new("udev event");
             state.backend.tty().on_udev_event(&mut state.niri, event);
         });
         event_loop
@@ -449,6 +452,7 @@ impl Tty {
         let input_backend = LibinputInputBackend::new(libinput.clone());
         event_loop
             .insert_source(input_backend, |mut event, _, state| {
+                let _slow = SlowDispatchGuard::new("libinput event");
                 state.process_libinput_event(&mut event);
                 state.process_input_event(event);
             })
@@ -456,6 +460,7 @@ impl Tty {
 
         event_loop
             .insert_source(notifier, move |event, _, state| {
+                let _slow = SlowDispatchGuard::new("session event");
                 state.backend.tty().on_session_event(&mut state.niri, event);
             })
             .unwrap();
@@ -895,6 +900,7 @@ impl Tty {
         let token = niri
             .event_loop
             .insert_source(drm_notifier, move |event, meta, state| {
+                let _slow = SlowDispatchGuard::new("DRM event");
                 let tty = state.backend.tty();
                 match event {
                     DrmEvent::VBlank(crtc) => {
@@ -2967,6 +2973,7 @@ fn queue_estimated_vblank_timer(
     let token = niri
         .event_loop
         .insert_source(timer, move |_, _, data| {
+            let _slow = SlowDispatchGuard::new("estimated VBlank timer");
             data.backend
                 .tty()
                 .on_estimated_vblank_timer(&mut data.niri, output.clone());

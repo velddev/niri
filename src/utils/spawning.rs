@@ -206,6 +206,7 @@ use systemd::do_spawn;
 #[cfg(feature = "systemd")]
 mod systemd {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use std::time::{Duration, Instant};
 
     use smithay::reexports::rustix;
     use smithay::reexports::rustix::io::{close, read, retry_on_intr, write};
@@ -247,16 +248,25 @@ mod systemd {
         // we will signal our intermediate child to exit. This way, even if the grandchild
         // exits quickly, a non-empty scope will be created (with just our intermediate
         // child), then cleaned up when our intermediate child exits.
+        //
+        // The grandchild waits for the same signal before it execs: anything it forks before
+        // systemd has moved it into the scope (Electron and Chromium fork their zygotes in the
+        // first milliseconds) would otherwise stay in niri's own cgroup for good. The signal is
+        // a byte per waiter rather than the pipe closing, because other children that niri forks
+        // at the same time hold copies of the write end until they exec. The grandchild gives up
+        // waiting after SCOPE_WAIT_TIMEOUT_MS, so a slow systemd delays an app, never hangs it.
+        //
+        // Command::spawn() returns only once the grandchild has exec'd (it holds the CLOEXEC pipe
+        // that reports exec errors), so the scope is set up on a second thread meanwhile.
 
-        // Make a pipe to receive the grandchild PID.
-
+        // Make a pipe to receive the grandchild and intermediate child PIDs.
         let (pipe_pid_read, pipe_pid_write) = pipe_with(PipeFlags::CLOEXEC)
             .map_err(|err| {
                 warn!("error creating a pipe to transfer child PID: {err:?}");
             })
             .ok()
             .unzip();
-        // Make a pipe to wait in the intermediate child.
+        // Make a pipe to wait on in the intermediate child and the grandchild.
         let (pipe_wait_read, pipe_wait_write) = pipe_with(PipeFlags::CLOEXEC)
             .map_err(|err| {
                 warn!("error creating a pipe for child to wait on: {err:?}");
@@ -291,9 +301,12 @@ mod systemd {
                     -1 => return Err(io::Error::last_os_error()),
                     0 => (),
                     grandchild_pid => {
-                        // Send back the PID.
+                        // Send back the PIDs.
                         if let Some(pipe) = pipe_pid_write {
-                            let _ = write_all(pipe, &grandchild_pid.to_ne_bytes());
+                            let mut buf = [0; 8];
+                            buf[..4].copy_from_slice(&grandchild_pid.to_ne_bytes());
+                            buf[4..].copy_from_slice(&libc::getpid().to_ne_bytes());
+                            let _ = write_all(pipe, &buf);
                         }
 
                         // Wait until the parent signals us to exit.
@@ -322,48 +335,118 @@ mod systemd {
                     }
                 }
 
+                // In the grandchild: don't exec until we're in the scope.
+                drop(pipe_pid_write);
+                if let Some(pipe) = pipe_wait_read {
+                    wait_for_byte(pipe.as_raw_fd(), SCOPE_WAIT_TIMEOUT_MS);
+                }
+
                 restore_nofile_rlimit();
 
                 Ok(())
             });
         }
 
-        let child = match process.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                warn!("error spawning {command:?}: {err:?}");
-                return None;
-            }
-        };
+        thread::scope(|s| {
+            // Wait for the PIDs, start the scope, then signal both children to go on. On every
+            // path out of here (including errors) the signal is sent or the pipe is closed.
+            let scope_thread = pipe_pid_read.map(|pipe| {
+                let pipe_wait_write = pipe_wait_write;
+                s.spawn(move || {
+                    let mut buf = [0; 8];
+                    match read_all(pipe, &mut buf) {
+                        Ok(()) => {
+                            let pid = i32::from_ne_bytes(buf[..4].try_into().unwrap());
+                            let intermediate_pid = i32::from_ne_bytes(buf[4..].try_into().unwrap());
+                            trace!("spawned PID: {pid}");
 
-        drop(pipe_pid_write);
-        drop(pipe_wait_read);
-
-        // Wait for the grandchild PID.
-        if let Some(pipe) = pipe_pid_read {
-            let mut buf = [0; 4];
-            match read_all(pipe, &mut buf) {
-                Ok(()) => {
-                    let pid = i32::from_ne_bytes(buf);
-                    trace!("spawned PID: {pid}");
-
-                    // Start a systemd scope for the grandchild.
-                    if let Err(err) = start_systemd_scope(command, child.id(), pid as u32) {
-                        trace!("error starting systemd scope for spawned command: {err:?}");
+                            // Start a systemd scope for the grandchild.
+                            let start = Instant::now();
+                            if let Err(err) =
+                                start_systemd_scope(command, intermediate_pid as u32, pid as u32)
+                            {
+                                trace!("error starting systemd scope for spawned command: {err:?}");
+                            }
+                            let elapsed = start.elapsed();
+                            if elapsed >= Duration::from_millis(SCOPE_WAIT_TIMEOUT_MS as u64) {
+                                warn!(
+                                    "starting the systemd scope for {command:?} took {elapsed:?}; \
+                                     it started before it was in its scope"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            // Also when spawning failed before forking: nothing to wait for.
+                            trace!("error reading child PID: {err:?}");
+                        }
                     }
-                }
+
+                    // Signal the intermediate child to exit and the grandchild to exec now that
+                    // we're done trying to create a systemd scope.
+                    trace!("signaling children to go on");
+                    if let Some(pipe) = pipe_wait_write {
+                        let _ = write_all(&pipe, &[0, 0]);
+                    }
+                })
+            });
+
+            let res = process.spawn();
+
+            // Unblock the PID reader if spawning failed before forking.
+            drop(pipe_pid_write);
+            drop(pipe_wait_read);
+
+            if let Some(thread) = scope_thread {
+                let _ = thread.join();
+            }
+
+            match res {
+                Ok(child) => Some(child),
                 Err(err) => {
-                    warn!("error reading child PID: {err:?}");
+                    warn!("error spawning {command:?}: {err:?}");
+                    None
                 }
             }
+        })
+    }
+
+    /// How long a spawned process waits for its systemd scope before it execs anyway.
+    const SCOPE_WAIT_TIMEOUT_MS: libc::c_int = 2000;
+
+    /// Waits until `fd` has a byte to read or reaches EOF, at most `timeout_ms`, then reads up
+    /// to one byte.
+    ///
+    /// Runs between fork and exec, so it sticks to async-signal-safe calls.
+    unsafe fn wait_for_byte(fd: libc::c_int, timeout_ms: libc::c_int) {
+        let now_ms = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+            ts.tv_sec as i64 * 1000 + ts.tv_nsec as i64 / 1_000_000
+        };
+        let deadline = now_ms() + i64::from(timeout_ms);
+        loop {
+            let left = deadline - now_ms();
+            if left <= 0 {
+                return;
+            }
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let n = libc::poll(&mut pfd, 1, left as libc::c_int);
+            if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if n > 0 {
+                let mut b = 0u8;
+                let _ = libc::read(fd, &mut b as *mut u8 as *mut libc::c_void, 1);
+            }
+            return;
         }
-
-        // Signal the intermediate child to exit now that we're done trying to creating a systemd
-        // scope.
-        trace!("signaling child to exit");
-        drop(pipe_wait_write);
-
-        Some(child)
     }
 
     fn write_all(fd: impl AsFd, buf: &[u8]) -> rustix::io::Result<()> {
@@ -481,5 +564,43 @@ mod systemd {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// The spawned process waits for its scope before it execs: make sure it never waits for the
+    /// timeout when there's no scope to create (not a systemd service), and that spawn errors
+    /// don't leave anything waiting either.
+    #[test]
+    fn spawn_does_not_wait_for_the_scope_timeout() {
+        let dir = std::env::temp_dir().join(format!("niri-spawn-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+
+        let start = Instant::now();
+        let script = format!("echo ok > {}", marker.display());
+        spawn_sync("sh", ["-c", &script], None);
+        // spawn_sync() waits for the intermediate child, which waits for the same signal as
+        // the grandchild.
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+
+        let end = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "the spawned command didn't run");
+
+        let start = Instant::now();
+        spawn_sync("/nonexistent/niri-test-command", Vec::<&str>::new(), None);
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

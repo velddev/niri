@@ -74,7 +74,7 @@ use smithay::utils::{
 use smithay::wayland::background_effect::BackgroundEffectState;
 use smithay::wayland::compositor::{
     with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
-    CompositorState, HookId, SurfaceData, TraversalAction,
+    CompositorState, HookId, SurfaceAttributes, SurfaceData, TraversalAction,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::DmabufState;
@@ -181,7 +181,7 @@ use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland, ResizeEdge,
+    send_scale_transform, write_png_rgba8, xwayland, ChangeTracked, ResizeEdge, SlowDispatchGuard,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -228,7 +228,13 @@ pub struct Niri {
 
     // Each workspace corresponds to a Space. Each workspace generally has one Output mapped to it,
     // however it may have none (when there are no outputs connected) or multiple (when mirroring).
-    pub layout: Layout<Mapped>,
+    ///
+    /// Mutable accesses are counted, see [`Niri::observer_generation`].
+    pub layout: ChangeTracked<Layout<Mapped>>,
+    /// Changes to what the per-iteration observers look at, outside of the layout.
+    observer_changes: u64,
+    /// The generation each observer last ran at.
+    observer_gate: ObserverGate,
 
     // This space does not actually contain any windows, but all outputs are mapped into it
     // according to their global position.
@@ -488,6 +494,9 @@ pub struct OutputState {
     screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// Timer (and when it fires) to send the frame callbacks that the unfocused-window cap held
+    /// back, in case nothing else sends frame callbacks on this output by then.
+    unfocused_fc_timer: Option<(Duration, RegistrationToken)>,
 }
 
 #[derive(Debug, Default)]
@@ -572,6 +581,80 @@ pub enum LockRenderState {
 struct SurfaceFrameThrottlingState {
     /// Output and sequence that the frame callback was last sent at.
     last_sent_at: RefCell<Option<(Output, u32)>>,
+}
+
+/// The generation (see [`Niri::observer_generation`]) at which each observer last ran.
+///
+/// The foreign-toplevel and ext-workspace protocols and the IPC event stream compare niri's
+/// windows, workspaces and focus against what they last sent, on every event loop iteration.
+/// That walk is skipped while nothing it looks at can have changed.
+#[derive(Debug, Default)]
+struct ObserverGate {
+    foreign_toplevel: Option<u64>,
+    ext_workspace: Option<u64>,
+    ipc_layout: Option<u64>,
+}
+
+/// With `NIRI_DEBUG_OBSERVER_GATE=1` (and always in tests), observers run on every iteration
+/// anyway, and an error is logged (a panic in tests) whenever one that the gate would have
+/// skipped found a change.
+fn debug_observer_gate() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test)
+        || *VALUE.get_or_init(|| env::var_os("NIRI_DEBUG_OBSERVER_GATE").is_some_and(|v| v == "1"))
+}
+
+fn observer_gate_missed(observer: &str) {
+    if cfg!(test) {
+        panic!("observer gate skipped a change: {observer}");
+    }
+    error!("observer gate skipped a change: {observer}");
+}
+
+/// When a frame callback was last sent to a surface of a visible, unfocused window.
+#[derive(Default)]
+struct UnfocusedFrameCapState {
+    last_sent_at: Cell<Option<Duration>>,
+}
+
+/// The frame callback cap for visible windows that are neither focused nor fullscreen.
+///
+/// Capped surfaces get a frame callback at most once per `interval`, on the first refresh cycle
+/// after each multiple of `interval` (in monotonic time), so all capped surfaces on an output
+/// commit in the same refresh cycles and niri redraws for them together.
+#[derive(Debug, Clone, Copy)]
+struct UnfocusedFrameCap {
+    interval: Duration,
+    refresh: Duration,
+}
+
+impl UnfocusedFrameCap {
+    /// The cap for a window on an output, or `None` when it runs uncapped.
+    ///
+    /// `rate` is the window's `unfocused-frame-rate` rule: `None` for the default of half the
+    /// refresh rate, `Some(0.)` for no cap.
+    fn new(refresh: Option<Duration>, rate: Option<f64>) -> Option<Self> {
+        let refresh = refresh?;
+        let interval = match rate {
+            None => refresh * 2,
+            Some(hz) if hz <= 0. => return None,
+            Some(hz) => Duration::from_secs_f64(1. / hz),
+        };
+        // A cap at or above the refresh rate would change nothing.
+        if interval.as_nanos() * 100 <= refresh.as_nanos() * 105 {
+            return None;
+        }
+        Some(Self { interval, refresh })
+    }
+
+    /// When a surface last sent a callback at `last` may get the next one.
+    fn next_allowed(&self, last: Duration) -> Duration {
+        let n = self.interval.as_nanos();
+        let next_tick = Duration::from_nanos(((last.as_nanos() / n + 1) * n) as u64);
+        // Half a refresh cycle of slack keeps a surface on the refresh cycles it settled on when
+        // the ticks fall close to them, instead of alternating between one and three cycles.
+        next_tick.max(last + self.interval - self.refresh / 2)
+    }
 }
 
 pub enum CenterCoords {
@@ -761,18 +844,25 @@ impl State {
     pub fn refresh_and_flush_clients(&mut self) {
         let _span = tracy_client::span!("State::refresh_and_flush_clients");
 
-        self.refresh();
+        {
+            let _slow = SlowDispatchGuard::new("refresh");
+            self.refresh();
+        }
 
         // Advance animations to the current time (not target render time) before rendering outputs
         // in order to clear completed animations and render elements. Even if we're not rendering,
         // it's good to advance every now and then so the workspace clean-up and animations don't
         // build up (the 1 second frame callback timer will call this line).
-        self.niri.advance_animations();
+        {
+            let _slow = SlowDispatchGuard::new("advancing animations");
+            self.niri.advance_animations();
+        }
 
         self.niri.redraw_queued_outputs(&mut self.backend);
 
         {
             let _span = tracy_client::span!("flush_clients");
+            let _slow = SlowDispatchGuard::new("flushing clients");
             self.niri.display_handle.flush_clients().unwrap();
         }
 
@@ -821,8 +911,23 @@ impl State {
         self.niri.global_space.refresh();
         self.niri.refresh_idle_inhibit();
         self.refresh_pointer_contents();
-        foreign_toplevel::refresh(self);
-        ext_workspace::refresh(self);
+
+        // Observers of the layout, focus and toplevels: skip them while nothing they look at has
+        // changed since they last ran.
+        let debug_gate = debug_observer_gate();
+        let generation = self.niri.observer_generation();
+        if self.niri.observer_gate.foreign_toplevel != Some(generation) {
+            foreign_toplevel::refresh(self);
+            self.niri.observer_gate.foreign_toplevel = Some(generation);
+        } else if debug_gate && foreign_toplevel::refresh(self) {
+            observer_gate_missed("foreign-toplevel");
+        }
+        if self.niri.observer_gate.ext_workspace != Some(generation) {
+            ext_workspace::refresh(self);
+            self.niri.observer_gate.ext_workspace = Some(generation);
+        } else if debug_gate && ext_workspace::refresh(self) {
+            observer_gate_missed("ext-workspace");
+        }
 
         #[cfg(feature = "xdp-gnome-screencast")]
         self.niri.refresh_mapped_cast_outputs();
@@ -834,7 +939,13 @@ impl State {
 
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
-        self.ipc_refresh_layout();
+        let generation = self.niri.observer_generation();
+        if self.niri.observer_gate.ipc_layout != Some(generation) {
+            self.ipc_refresh_layout();
+            self.niri.observer_gate.ipc_layout = Some(generation);
+        } else if debug_gate && self.ipc_refresh_layout() {
+            observer_gate_missed("IPC layout");
+        }
         self.ipc_refresh_keyboard_layout_index();
 
         // Needs to be called after updating the keyboard focus.
@@ -1284,6 +1395,7 @@ impl State {
 
         let keyboard = self.niri.seat.get_keyboard().unwrap();
         if self.niri.keyboard_focus != focus {
+            self.niri.observers_changed();
             trace!(
                 "keyboard focus changed from {:?} to {:?}",
                 self.niri.keyboard_focus,
@@ -2132,6 +2244,7 @@ impl State {
         to_screenshot: &async_channel::Sender<NiriToScreenshot>,
         msg: ScreenshotToNiri,
     ) {
+        let _slow = SlowDispatchGuard::new("D-Bus screenshot request");
         match msg {
             ScreenshotToNiri::TakeScreenshot { include_cursor } => {
                 self.handle_take_screenshot(to_screenshot, include_cursor);
@@ -2476,6 +2589,7 @@ impl Niri {
             let socket_name = socket_source.socket_name().to_os_string();
             event_loop
                 .insert_source(socket_source, move |client, _, state| {
+                    let _slow = SlowDispatchGuard::new("new Wayland client");
                     state.niri.insert_client(NewClient {
                         client,
                         restricted: false,
@@ -2500,6 +2614,7 @@ impl Niri {
         let display_source = Generic::new(display, Interest::READ, Mode::Level);
         event_loop
             .insert_source(display_source, |_, display, state| {
+                let _slow = SlowDispatchGuard::new("Wayland client requests");
                 // SAFETY: we don't drop the display.
                 unsafe {
                     display.get_mut().dispatch_clients(state).unwrap();
@@ -2537,7 +2652,9 @@ impl Niri {
             is_at_startup: true,
             clock: animation_clock,
 
-            layout,
+            layout: ChangeTracked::new(layout),
+            observer_changes: 0,
+            observer_gate: ObserverGate::default(),
             global_space: Space::default(),
             sorted_outputs: Vec::default(),
             output_state: HashMap::new(),
@@ -2769,6 +2886,8 @@ impl Niri {
             outputs.iter().map(|d| &d.name.connector)
         );
 
+        // ext-workspace sends workspace groups by output.
+        self.observers_changed();
         self.sorted_outputs = outputs
             .iter()
             .map(|Data { output, .. }| output.clone())
@@ -2917,6 +3036,7 @@ impl Niri {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            unfocused_fc_timer: None,
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -3745,7 +3865,9 @@ impl Niri {
         }) {
             trace!("redrawing output");
             let output = output.clone();
+            let start = Instant::now();
             self.redraw(backend, &output);
+            crate::utils::log_if_slow_dispatch("redraw of ", &output.name(), start);
         }
     }
 
@@ -4053,7 +4175,8 @@ impl Niri {
             KeyboardFocus::Mru => true,
         };
 
-        self.layout.refresh(layout_is_active);
+        // Only updates state derived from changes that were counted when they were made.
+        ChangeTracked::untracked_mut(&mut self.layout).refresh(layout_is_active);
     }
 
     pub fn refresh_idle_inhibit(&mut self) {
@@ -4073,8 +4196,9 @@ impl Niri {
     pub fn refresh_window_states(&mut self) {
         let _span = tracy_client::span!("Niri::refresh_window_states");
 
+        // The tiled state reaches observers only once the client commits it.
         let config = self.config.borrow();
-        self.layout.with_windows_mut(|mapped, _output| {
+        ChangeTracked::untracked_mut(&mut self.layout).with_windows_mut(|mapped, _output| {
             mapped.update_tiled_state(config.prefer_no_csd);
         });
         drop(config);
@@ -4088,7 +4212,9 @@ impl Niri {
 
         let mut windows = vec![];
         let mut outputs = HashSet::new();
-        self.layout.with_windows_mut(|mapped, output| {
+        // Windows whose rules changed go through update_window() below, which counts as a change.
+        let layout = ChangeTracked::untracked_mut(&mut self.layout);
+        layout.with_windows_mut(|mapped, output| {
             if mapped.recompute_window_rules_if_needed(window_rules, self.is_at_startup) {
                 windows.push(mapped.window.clone());
 
@@ -4115,10 +4241,30 @@ impl Niri {
         }
     }
 
+    /// A number that changes whenever anything the per-iteration observers look at may have
+    /// changed: the layout (any mutable access), keyboard focus, toplevel titles, app ids and
+    /// states, app menus.
+    pub fn observer_generation(&self) -> u64 {
+        ChangeTracked::generation(&self.layout)
+            .wrapping_add(self.observer_changes)
+            .wrapping_add(crate::protocols::appmenu::generation())
+    }
+
+    /// Marks that something the per-iteration observers look at changed outside of the layout.
+    pub fn observers_changed(&mut self) {
+        self.observer_changes = self.observer_changes.wrapping_add(1);
+    }
+
     pub fn advance_animations(&mut self) {
         let _span = tracy_client::span!("Niri::advance_animations");
 
-        self.layout.advance_animations();
+        // Advancing animations changes the layout only while something is animating, or right
+        // after, when finished animations get cleaned up.
+        if self.layout.are_transitions_ongoing() {
+            self.layout.advance_animations();
+        } else {
+            ChangeTracked::untracked_mut(&mut self.layout).advance_animations();
+        }
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
@@ -4135,7 +4281,7 @@ impl Niri {
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
         self.update_xray_render_elements(output);
-        self.layout.update_render_elements(output);
+        ChangeTracked::untracked_mut(&mut self.layout).update_render_elements(output);
 
         for (out, state) in self.output_state.iter_mut() {
             if output.is_none_or(|output| out == output) {
@@ -5128,13 +5274,81 @@ impl Niri {
 
         let frame_callback_time = get_monotonic_time();
 
-        for mapped in self.layout.windows_for_output_mut(output) {
-            if mapped.rules().frame_callbacks_when_hidden == Some(true) {
+        // Visible windows that are neither focused nor fullscreen get frame callbacks at a capped
+        // rate (by default half the refresh rate): their clients draw and commit less often, for
+        // a fraction of the CPU, and niri redraws for them less often.
+        let refresh = state.frame_clock.refresh_interval();
+        let layout_focus = self.layout.focus().map(|mapped| mapped.id());
+        // The earliest time a held-back surface may get its callback.
+        let next_capped = Cell::new(None::<Duration>);
+        let should_send_capped = |cap: UnfocusedFrameCap| {
+            let next_capped = &next_capped;
+            let should_send = &should_send;
+            move |surface: &WlSurface, states: &SurfaceData| {
+                let current_primary_output = surface_primary_scanout_output(surface, states);
+                if current_primary_output.as_ref() != Some(output) {
+                    return None;
+                }
+
+                // Only hold back surfaces that wait for a callback.
+                let waiting = !states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .frame_callbacks
+                    .is_empty();
+                if !waiting {
+                    return should_send(surface, states);
+                }
+
+                let cap_state = states
+                    .data_map
+                    .get_or_insert(UnfocusedFrameCapState::default);
+                if let Some(last) = cap_state.last_sent_at.get() {
+                    let next = cap.next_allowed(last);
+                    if frame_callback_time < next {
+                        let earliest = next_capped.get().map_or(next, |x: Duration| x.min(next));
+                        next_capped.set(Some(earliest));
+                        return None;
+                    }
+                }
+
+                let rv = should_send(surface, states);
+                if rv.is_some() {
+                    cap_state.last_sent_at.set(Some(frame_callback_time));
+                }
+                rv
+            }
+        };
+
+        for mapped in ChangeTracked::untracked_mut(&mut self.layout).windows_for_output_mut(output)
+        {
+            let rules = mapped.rules();
+            if rules.frame_callbacks_when_hidden == Some(true) {
                 mapped.send_frame(
                     output,
                     frame_callback_time,
                     FRAME_CALLBACK_THROTTLE,
                     should_send_hidden,
+                );
+                continue;
+            }
+
+            let cap = if mapped.is_focused()
+                || Some(mapped.id()) == layout_focus
+                || mapped.sizing_mode().is_fullscreen()
+            {
+                None
+            } else {
+                UnfocusedFrameCap::new(refresh, rules.unfocused_frame_rate)
+            };
+
+            if let Some(cap) = cap {
+                mapped.send_frame(
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    should_send_capped(cap),
                 );
             } else {
                 mapped.send_frame(
@@ -5184,6 +5398,50 @@ impl Niri {
                 should_send,
             );
         }
+
+        if let Some(next) = next_capped.get() {
+            // Otherwise a redraw or a VBlank is coming, and with it the next frame callbacks.
+            if matches!(self.output_state[output].redraw_state, RedrawState::Idle) {
+                self.schedule_unfocused_frame_callbacks(output, next);
+            }
+        }
+    }
+
+    /// Makes sure that the surfaces that the unfocused-window cap held back get their frame
+    /// callbacks at `due` (monotonic time), even if this output has nothing to redraw by then.
+    fn schedule_unfocused_frame_callbacks(&mut self, output: &Output, due: Duration) {
+        let Some(state) = self.output_state.get_mut(output) else {
+            return;
+        };
+        // A little late rather than early, so the surfaces are due when it fires.
+        let due = due + Duration::from_micros(300);
+        if let Some((pending, token)) = state.unfocused_fc_timer {
+            if pending <= due {
+                return;
+            }
+            self.event_loop.remove(token);
+        }
+
+        let delay = due
+            .saturating_sub(get_monotonic_time())
+            .max(Duration::from_millis(1));
+        let output = output.clone();
+        let token = self
+            .event_loop
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                let niri = &mut state.niri;
+                let _slow = SlowDispatchGuard::new("unfocused frame callback timer");
+                if let Some(output_state) = niri.output_state.get_mut(&output) {
+                    output_state.unfocused_fc_timer = None;
+                    // Otherwise a redraw or a VBlank is coming, and frame callbacks with it.
+                    if matches!(output_state.redraw_state, RedrawState::Idle) {
+                        niri.send_frame_callbacks(&output);
+                    }
+                }
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        state.unfocused_fc_timer = Some((due, token));
     }
 
     pub fn send_frame_callbacks_on_fallback_timer(&mut self) {
@@ -6672,5 +6930,71 @@ niri_render_elements! {
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
+    }
+}
+
+#[cfg(test)]
+mod unfocused_frame_cap_tests {
+    use super::*;
+
+    const REFRESH_144: Duration = Duration::from_nanos(6_944_444);
+
+    /// Simulates refresh cycles with some jitter and returns the cycles a capped surface that
+    /// always waits for a callback gets one on.
+    fn sent_cycles(cap: UnfocusedFrameCap, phase: Duration, cycles: u32) -> Vec<u32> {
+        let mut last = None;
+        let mut sent = vec![];
+        let mut rng = 12345u64;
+        for i in 0..cycles {
+            // Up to ±0.15 ms of pseudo-random jitter.
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let jitter_us = (rng >> 33) % 301;
+            let now =
+                phase + REFRESH_144 * i + Duration::from_secs(1) + Duration::from_micros(jitter_us)
+                    - Duration::from_micros(150);
+            if last.is_none_or(|last| now >= cap.next_allowed(last)) {
+                last = Some(now);
+                sent.push(i);
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn default_cap_is_every_other_cycle() {
+        let cap = UnfocusedFrameCap::new(Some(REFRESH_144), None).unwrap();
+        // Whatever the phase of the refresh cycles against the ticks, the surface settles on
+        // every other cycle instead of alternating between one and three: after the first few
+        // cycles, never one cycle apart, and three apart at most once (when it moves off a
+        // tick it sat right on).
+        for phase_us in (0..14_000).step_by(250) {
+            let sent = sent_cycles(cap, Duration::from_micros(phase_us), 400);
+            let gaps: Vec<_> = sent.windows(2).map(|w| w[1] - w[0]).collect();
+            let settled = &gaps[5..];
+            assert!(
+                settled.iter().all(|&gap| gap == 2 || gap == 3)
+                    && settled.iter().filter(|&&gap| gap == 3).count() <= 1,
+                "phase {phase_us} us: gaps {gaps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_sets_or_turns_off_the_cap() {
+        assert!(UnfocusedFrameCap::new(None, None).is_none());
+        assert!(UnfocusedFrameCap::new(Some(REFRESH_144), Some(0.)).is_none());
+        assert!(UnfocusedFrameCap::new(Some(REFRESH_144), Some(144.)).is_none());
+        assert!(UnfocusedFrameCap::new(Some(REFRESH_144), Some(240.)).is_none());
+
+        let cap = UnfocusedFrameCap::new(Some(REFRESH_144), Some(36.)).unwrap();
+        let sent = sent_cycles(cap, Duration::ZERO, 1440);
+        // 10 s at 144 Hz.
+        assert!(
+            (355..=361).contains(&sent.len()),
+            "{} callbacks",
+            sent.len()
+        );
     }
 }

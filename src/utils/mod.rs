@@ -48,6 +48,98 @@ pub mod xwayland;
 
 pub static IS_SYSTEMD_SERVICE: AtomicBool = AtomicBool::new(false);
 
+/// Event loop work that takes longer than this gets a debug log, to find what stalls the main loop
+/// (and makes libinput warn that it's lagging behind).
+pub const SLOW_DISPATCH: Duration = Duration::from_millis(16);
+
+/// Logs, at debug level with the `niri::slow_dispatch` target, how long the work between its
+/// creation and its drop took, when that's longer than [`SLOW_DISPATCH`].
+///
+/// Costs two clock reads; silence it with `RUST_LOG=...,niri::slow_dispatch=off`.
+#[must_use]
+pub struct SlowDispatchGuard {
+    what: &'static str,
+    start: std::time::Instant,
+}
+
+impl SlowDispatchGuard {
+    pub fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowDispatchGuard {
+    fn drop(&mut self) {
+        log_if_slow_dispatch(self.what, "", self.start);
+    }
+}
+
+/// Logs like [`SlowDispatchGuard`], with a detail such as an output name.
+pub fn log_if_slow_dispatch(what: &str, detail: &str, start: std::time::Instant) {
+    let elapsed = start.elapsed();
+    if elapsed >= SLOW_DISPATCH {
+        let ms = elapsed.as_secs_f64() * 1000.;
+        debug!(target: "niri::slow_dispatch", "{what}{detail} took {ms:.1} ms");
+    }
+}
+
+/// A value that counts its mutable accesses: a cheap, conservative "may have changed" signal.
+///
+/// Every `&mut` access through `DerefMut` (including method calls that take `&mut self`)
+/// increments the generation, so code that only needs to know whether anything could have
+/// changed since it last looked compares generations instead of walking the value. Hot paths that
+/// mutate parts nobody observes this way (rendering, animation ticks) use
+/// [`ChangeTracked::untracked_mut`] and bump the generation themselves when it matters.
+#[derive(Debug)]
+pub struct ChangeTracked<T> {
+    value: T,
+    generation: u64,
+}
+
+impl<T> ChangeTracked<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            generation: 0,
+        }
+    }
+
+    /// The number of mutable accesses so far (wrapping).
+    pub fn generation(this: &Self) -> u64 {
+        this.generation
+    }
+
+    /// Marks the value as changed.
+    pub fn bump(this: &mut Self) {
+        this.generation = this.generation.wrapping_add(1);
+    }
+
+    /// Mutable access that doesn't count as a change.
+    ///
+    /// Only for code that changes nothing that generation-gated observers look at.
+    pub fn untracked_mut(this: &mut Self) -> &mut T {
+        &mut this.value
+    }
+}
+
+impl<T> std::ops::Deref for ChangeTracked<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for ChangeTracked<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.generation = self.generation.wrapping_add(1);
+        &mut self.value
+    }
+}
+
 use id::IdCounter;
 
 /// Unique ID for a screencast session.

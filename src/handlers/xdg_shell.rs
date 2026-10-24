@@ -898,10 +898,12 @@ impl XdgShellHandler for State {
     }
 
     fn app_id_changed(&mut self, toplevel: ToplevelSurface) {
+        self.niri.observers_changed();
         self.update_window_rules(&toplevel);
     }
 
     fn title_changed(&mut self, toplevel: ToplevelSurface) {
+        self.niri.observers_changed();
         self.update_window_rules(&toplevel);
     }
 
