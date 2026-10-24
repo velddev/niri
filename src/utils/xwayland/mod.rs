@@ -16,8 +16,9 @@ const X11_TMP_UNIX_DIR: &str = "/tmp/.X11-unix";
 
 struct X11Connection {
     display_name: String,
-    // Optional because there are no abstract sockets on FreeBSD.
-    abstract_fd: Option<OwnedFd>,
+    // Bound but never listening, see reserve_abstract_socket(). Optional because there are no
+    // abstract sockets on FreeBSD.
+    _abstract_guard: Option<OwnedFd>,
     unix_fd: OwnedFd,
     _unix_guard: Unlink,
     _lock_guard: Unlink,
@@ -82,13 +83,28 @@ fn bind_to_socket(addr: &SocketAddr) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
+// Xwayland runs without X authorization, so anyone who can connect can read windows and send
+// input. Abstract sockets ignore the mount namespace: every process in our network namespace
+// could reach one, including flatpaks without the x11 permission. So X clients only get the
+// /tmp/.X11-unix path socket, which the filesystem and the sandboxes guard.
+//
+// The abstract name is still bound, without listening, so that no other process can take it:
+// libxcb tries the abstract socket first. Connecting to it fails with ECONNREFUSED, and libxcb
+// then falls back to the path socket.
 #[cfg(target_os = "linux")]
-fn bind_to_abstract_socket(display: u32) -> anyhow::Result<UnixListener> {
-    use std::os::linux::net::SocketAddrExt;
+fn reserve_abstract_socket(display: u32) -> anyhow::Result<OwnedFd> {
+    use rustix::net::{bind, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 
     let name = format!("/tmp/.X11-unix/X{display}");
-    let addr = SocketAddr::from_abstract_name(name).unwrap();
-    bind_to_socket(&addr)
+    let addr = SocketAddrUnix::new_abstract_name(name.as_bytes())?;
+    let fd = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    bind(&fd, &addr).context("error binding socket")?;
+    Ok(fd)
 }
 
 fn bind_to_unix_socket(display: u32) -> anyhow::Result<(UnixListener, Unlink)> {
@@ -100,11 +116,9 @@ fn bind_to_unix_socket(display: u32) -> anyhow::Result<(UnixListener, Unlink)> {
     bind_to_socket(&addr).map(|listener| (listener, guard))
 }
 
-fn open_display_sockets(
-    display: u32,
-) -> anyhow::Result<(Option<UnixListener>, UnixListener, Unlink)> {
+fn open_display_sockets(display: u32) -> anyhow::Result<(Option<OwnedFd>, UnixListener, Unlink)> {
     #[cfg(target_os = "linux")]
-    let a = Some(bind_to_abstract_socket(display).context("error binding to abstract socket")?);
+    let a = Some(reserve_abstract_socket(display).context("error reserving abstract socket")?);
     #[cfg(not(target_os = "linux"))]
     let a = None;
 
@@ -147,12 +161,11 @@ fn setup_connection() -> anyhow::Result<X11Connection> {
     };
 
     let display_name = format!(":{display}");
-    let abstract_fd = a.map(OwnedFd::from);
     let unix_fd = OwnedFd::from(u);
 
     Ok(X11Connection {
         display_name,
-        abstract_fd,
+        _abstract_guard: a,
         unix_fd,
         _unix_guard: unix_guard,
         _lock_guard: lock_guard,
