@@ -12,5 +12,6 @@ mod layer_shell;
 mod observer_gate;
 mod on_demand_refocus;
 mod remove_output;
+mod toplevel_export;
 mod transactions;
 mod window_opening;

@@ -5786,6 +5786,8 @@ impl Niri {
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::render_toplevel_export");
 
+        ensure!(!self.is_locked(), "the session is locked");
+
         let Some((mapped, output)) = self.layout.find_window_and_output(export.surface()) else {
             bail!("window to export is gone");
         };

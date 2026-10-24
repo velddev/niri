@@ -2,14 +2,24 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
+use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
+use hyprland_toplevel_export::hyprland_toplevel_export_frame_v1::{
+    self, HyprlandToplevelExportFrameV1,
+};
+use hyprland_toplevel_export::hyprland_toplevel_export_manager_v1::HyprlandToplevelExportManagerV1;
+use session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
+use session_lock::v1::client::ext_session_lock_surface_v1::{self, ExtSessionLockSurfaceV1};
+use session_lock::v1::client::ext_session_lock_v1::{self, ExtSessionLockV1};
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+use smithay::reexports::rustix;
+use smithay::reexports::wayland_protocols::ext::session_lock;
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
@@ -31,10 +41,31 @@ use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_shm::{self, WlShm};
+use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
 use crate::utils::id::IdCounter;
+
+pub mod hyprland_toplevel_export {
+    #![allow(dead_code, non_camel_case_types, unused_unsafe, unused_variables)]
+    #![allow(non_upper_case_globals, non_snake_case, unused_imports)]
+    #![allow(missing_docs, clippy::all)]
+
+    use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::client::*;
+    use wayland_client;
+    use wayland_client::protocol::*;
+
+    pub mod __interfaces {
+        use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::client::__interfaces::*;
+        use wayland_client::protocol::__interfaces::*;
+        wayland_scanner::generate_interfaces!("resources/hyprland-toplevel-export-v1.xml");
+    }
+    use self::__interfaces::*;
+
+    wayland_scanner::generate_client_code!("resources/hyprland-toplevel-export-v1.xml");
+}
 
 pub struct Client {
     pub id: ClientId,
@@ -56,6 +87,9 @@ pub struct State {
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
+    pub shm: Option<WlShm>,
+    pub session_lock_manager: Option<ExtSessionLockManagerV1>,
+    pub toplevel_export_manager: Option<HyprlandToplevelExportManagerV1>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -125,6 +159,30 @@ pub struct SyncData {
     pub done: AtomicBool,
 }
 
+pub struct LockSurfaceData {
+    pub surface: WlSurface,
+    pub viewport: WpViewport,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExportResult {
+    #[default]
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Default)]
+pub struct ExportFrameData {
+    pub result: Mutex<ExportResult>,
+}
+
+impl ExportFrameData {
+    pub fn result(&self) -> ExportResult {
+        *self.result.lock().unwrap()
+    }
+}
+
 static CLIENT_ID_COUNTER: IdCounter = IdCounter::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -182,6 +240,9 @@ impl Client {
             layer_shell: None,
             spbm: None,
             viewporter: None,
+            shm: None,
+            session_lock_manager: None,
+            toplevel_export_manager: None,
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -245,6 +306,41 @@ impl Client {
         region.destroy();
     }
 
+    /// Locks the session and maps a lock surface on every output.
+    pub fn lock_session(&mut self) -> ExtSessionLockV1 {
+        let manager = self.state.session_lock_manager.as_ref().unwrap();
+        let compositor = self.state.compositor.as_ref().unwrap();
+        let viewporter = self.state.viewporter.as_ref().unwrap();
+
+        let lock = manager.lock(&self.qh, ());
+        for output in self.state.outputs.keys() {
+            let surface = compositor.create_surface(&self.qh, ());
+            let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+            let data = LockSurfaceData {
+                surface: surface.clone(),
+                viewport,
+            };
+            lock.get_lock_surface(&surface, output, &self.qh, data);
+        }
+        lock
+    }
+
+    /// Asks hyprland-toplevel-export to copy the niri window with this id into a new shm buffer
+    /// of the given size: right away with `ignore_damage`, else on the window's next commit.
+    pub fn capture_window(
+        &mut self,
+        window_id: u32,
+        size: (i32, i32),
+        ignore_damage: bool,
+    ) -> Arc<ExportFrameData> {
+        let manager = self.state.toplevel_export_manager.as_ref().unwrap();
+        let data = Arc::new(ExportFrameData::default());
+        let frame = manager.capture_toplevel(0, window_id, &self.qh, data.clone());
+        let buffer = self.state.create_shm_buffer(size);
+        frame.copy(&buffer, i32::from(ignore_damage));
+        data
+    }
+
     pub fn output(&mut self, name: &str) -> WlOutput {
         self.state
             .outputs
@@ -257,6 +353,18 @@ impl Client {
 }
 
 impl State {
+    pub fn create_shm_buffer(&mut self, (w, h): (i32, i32)) -> WlBuffer {
+        let shm = self.shm.as_ref().unwrap();
+        let len = w * h * 4;
+
+        let fd = rustix::fs::memfd_create("niri-test", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        rustix::fs::ftruncate(&fd, len as u64).unwrap();
+        let pool = shm.create_pool(fd.as_fd(), len, &self.qh, ());
+        let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Xrgb8888, &self.qh, ());
+        pool.destroy();
+        buffer
+    }
+
     pub fn create_window(&mut self) -> &mut Window {
         let compositor = self.compositor.as_ref().unwrap();
         let xdg_wm_base = self.xdg_wm_base.as_ref().unwrap();
@@ -530,6 +638,15 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WpViewporter::interface().name {
                     let version = min(version, WpViewporter::interface().version);
                     state.viewporter = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WlShm::interface().name {
+                    let version = min(version, WlShm::interface().version);
+                    state.shm = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ExtSessionLockManagerV1::interface().name {
+                    let version = min(version, ExtSessionLockManagerV1::interface().version);
+                    state.session_lock_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == HyprlandToplevelExportManagerV1::interface().name {
+                    // Version 1: copy right away, without waiting for buffer_done.
+                    state.toplevel_export_manager = Some(registry.bind(name, 1, qh, ()));
                 } else if interface == WlOutput::interface().name {
                     let version = min(version, WlOutput::interface().version);
                     let output = registry.bind(name, version, qh, ());
@@ -798,5 +915,126 @@ impl Dispatch<WpViewport, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<WlShm, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlShm,
+        event: <WlShm as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_shm::Event::Format { .. } => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WlShmPool, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlShmPool,
+        _event: <WlShmPool as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ExtSessionLockManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtSessionLockManagerV1,
+        _event: <ExtSessionLockManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ExtSessionLockV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtSessionLockV1,
+        event: <ExtSessionLockV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_v1::Event::Locked => (),
+            ext_session_lock_v1::Event::Finished => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<ExtSessionLockSurfaceV1, LockSurfaceData> for State {
+    fn event(
+        state: &mut Self,
+        lock_surface: &ExtSessionLockSurfaceV1,
+        event: <ExtSessionLockSurfaceV1 as wayland_client::Proxy>::Event,
+        data: &LockSurfaceData,
+        _conn: &Connection,
+        qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            // Map right away with a buffer of the configured size.
+            ext_session_lock_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                lock_surface.ack_configure(serial);
+                let spbm = state.spbm.as_ref().unwrap();
+                let buffer = spbm.create_u32_rgba_buffer(0, 0, 0, u32::MAX, qhandle, ());
+                data.surface.attach(Some(&buffer), 0, 0);
+                data.viewport.set_destination(width as i32, height as i32);
+                data.surface.commit();
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<HyprlandToplevelExportManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &HyprlandToplevelExportManagerV1,
+        _event: <HyprlandToplevelExportManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<HyprlandToplevelExportFrameV1, Arc<ExportFrameData>> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &HyprlandToplevelExportFrameV1,
+        event: <HyprlandToplevelExportFrameV1 as wayland_client::Proxy>::Event,
+        data: &Arc<ExportFrameData>,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            hyprland_toplevel_export_frame_v1::Event::Ready { .. } => {
+                *data.result.lock().unwrap() = ExportResult::Ready;
+            }
+            hyprland_toplevel_export_frame_v1::Event::Failed => {
+                *data.result.lock().unwrap() = ExportResult::Failed;
+            }
+            _ => (),
+        }
     }
 }
