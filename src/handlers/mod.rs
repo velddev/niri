@@ -696,6 +696,10 @@ impl ToplevelExportHandler for State {
     }
 
     fn export_frame(&mut self, export: ToplevelExport, ignore_damage: bool) {
+        // Window contents stay hidden while the session is locked. Dropping the export fails it.
+        if self.niri.is_locked() {
+            return;
+        }
         if !ignore_damage {
             // Wait for the window to commit new contents (see the compositor commit handler).
             self.niri.toplevel_export_state.push(export);
@@ -716,7 +720,8 @@ impl State {
     /// Render the window copies that were waiting for this toplevel to commit.
     pub fn render_waiting_toplevel_exports(&mut self, surface: &WlSurface) {
         let exports = self.niri.toplevel_export_state.take_for(surface);
-        if exports.is_empty() {
+        // Copies queued before the lock fail here (on drop) instead of rendering.
+        if exports.is_empty() || self.niri.is_locked() {
             return;
         }
         self.backend.with_primary_renderer(|renderer| {
