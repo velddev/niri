@@ -326,6 +326,9 @@ struct GroupSync {
     /// commit. The neighbouring columns and the view follow the group's width when the windows
     /// commit, like they follow a plain column's windows.
     shown_width: Option<f64>,
+    /// The column's configuration changed since this layout (another output, struts, scale,
+    /// gaps, borders): the next relayout is for that and goes out at once.
+    outdated: bool,
 }
 
 /// How the tiles of a split group go to their slots after the group's layout changed.
@@ -5432,6 +5435,11 @@ impl<W: LayoutElement> Column<W> {
     ) {
         let mut update_sizes = false;
 
+        // A group's relayout for the new configuration doesn't wait for one in flight.
+        if let Some(sync) = &mut self.group_sync {
+            sync.outdated = true;
+        }
+
         if self.view_size != view_size
             || self.working_area != working_area
             || self.parent_area != parent_area
@@ -7113,7 +7121,7 @@ impl<W: LayoutElement> Column<W> {
             && group.filled_count() == self.tiles.len();
         if matches!(moves, SlotMoves::Jump) && same_slots {
             if let Some(sync) = &mut self.group_sync {
-                if now < sync.deadline {
+                if now < sync.deadline && !sync.outdated {
                     sync.deferred = Some(sync.deferred.unwrap_or(false) || width_change);
                     return;
                 }
@@ -7186,6 +7194,7 @@ impl<W: LayoutElement> Column<W> {
                 deadline: now + TRANSACTION_TIME_LIMIT,
                 deferred: None,
                 shown_width,
+                outdated: false,
             });
         } else {
             self.group_sync = None;
