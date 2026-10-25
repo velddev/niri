@@ -5033,7 +5033,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     view_off + Point::from((col_x, 0.)) + col.render_offset() + col.tiles_origin();
                 let pos = pos.to_physical_precise_round(scale).to_logical(scale);
                 let windows = col.tiles.iter().map(|t| t.window()).collect();
-                Some((group.id(), Rectangle::new(pos, group.size()), windows))
+                // As drawn: a width change shows once the windows commit it.
+                let size = Size::from((col.width(), group.size().h));
+                Some((group.id(), Rectangle::new(pos, size), windows))
             },
         )
     }
