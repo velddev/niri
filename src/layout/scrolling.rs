@@ -16,10 +16,7 @@ use super::monitor::InsertPosition;
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
-use super::{
-    ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile,
-    RESIZE_ANIMATION_THRESHOLD,
-};
+use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::SizingMode;
@@ -246,6 +243,9 @@ pub struct Column<W: LayoutElement> {
     /// never fullscreen or maximized. See `docs/wiki/Development:-Split-Groups.md`.
     group: Option<Group>,
 
+    /// A relayout of the group whose windows haven't all committed their new sizes yet.
+    group_sync: Option<GroupSync>,
+
     /// Where this column's window came from, if it left a group to go fullscreen or maximized.
     ///
     /// When it goes back to normal, it returns into its slot.
@@ -284,38 +284,69 @@ struct TileData {
     /// is a group. Moves with the tile, so a new layout knows where the tile was before.
     group_rect: Option<Rectangle<f64, Logical>>,
 
-    /// Set while the tile waits in a group for its window to commit a new size before it moves
-    /// to `group_rect` (see [`SlotMoves::InPlace`]).
+    /// Set while the tile waits in a group, where it is drawn, for the windows of the group to
+    /// commit their new sizes before it moves to `group_rect` (see [`GroupSync`]).
     group_hold: Option<SlotHold>,
 }
 
-/// A group tile held where it is drawn until its window commits the new size of its slot, so
-/// that its move to the slot runs together with its resize animation.
+/// A group tile held where it is drawn until the windows of the group commit the new sizes of
+/// their slots (see [`GroupSync`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SlotHold {
     /// Where the tile is held, relative to the column's tiles origin.
     loc: Point<f64, Logical>,
-    /// The tile's size when the hold began: the first commit that changes it ends the hold.
-    size: Size<f64, Logical>,
-    /// Unadjusted clock time at which the tile stops waiting and moves anyway (a hung or slow
-    /// client), the same time limit as the transaction of the configure.
+    /// How the tile goes to its slot when the hold ends: with this animation, which runs in
+    /// step with its resize animation (started by the same commit), or, if `None`, at once (an
+    /// interactive resize, which doesn't animate).
+    glide: Option<niri_config::Animation>,
+}
+
+/// A relayout of a split group that waits for its windows' commits.
+///
+/// The windows get their new sizes in one transaction, so their commits apply together, on one
+/// frame. The layout keeps every slot that changed drawn where the windows' current buffers are
+/// (see [`SlotHold`]) until then: a slot is never drawn at its new place with a buffer of its old
+/// size, and neighbouring slots never run ahead of each other. Once every window has committed
+/// its requested size (or the transaction time limit passed), all held slots go to their new
+/// places at once.
+///
+/// Like the throttling of a single window's configures, an interactive resize or any other
+/// relayout without animation ([`SlotMoves::Jump`]) doesn't go out while one is in flight: the
+/// newest layout goes out when the windows caught up, so no stale sizes queue up and a fast
+/// window doesn't run ahead of a slow neighbour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GroupSync {
+    /// Unadjusted clock time at which the group stops waiting (a slow or hung client): the time
+    /// limit of the transaction.
     deadline: Duration,
+    /// A relayout without animation came in meanwhile; `Some(true)` if it changed the column's
+    /// width (see `shown_width`).
+    deferred: Option<bool>,
+    /// For a change of the column's width: the width of the group as drawn until the windows
+    /// commit. The neighbouring columns and the view follow the group's width when the windows
+    /// commit, like they follow a plain column's windows.
+    shown_width: Option<f64>,
+    /// The column's configuration changed since this layout (another output, struts, scale,
+    /// gaps, borders): the next relayout is for that and goes out at once.
+    outdated: bool,
 }
 
 /// How the tiles of a split group go to their slots after the group's layout changed.
 #[derive(Debug, Clone, Copy)]
 enum SlotMoves {
-    /// They jump (an interactive resize follows the pointer).
+    /// They jump (an interactive resize follows the pointer), together, once the windows of the
+    /// group committed their new sizes (see [`GroupSync`]).
     Jump,
     /// They move at once with this animation: the column moves in the strip too (a merge, a
     /// pop-out), so they must move with it.
     Now(niri_config::Animation),
     /// The column stays where it is (rotate, share changes, inserting or removing a window
-    /// inside the group). Tiles whose slot keeps its size move at once with this animation.
-    /// Tiles whose slot changes size stay where they are drawn until their window commits the
-    /// new size, then move with the window-resize animation, together with their resize, like
-    /// the windows of a plain column. Moved at once this early, they'd go to the new place at
-    /// the old size and stick out of the group until the commit.
+    /// inside the group, column width changes). While windows of the group have yet to commit
+    /// their new sizes, the tiles whose slot changed stay where they are drawn until all of
+    /// them committed, then move together with the window-resize animation, in step with their
+    /// resizes, like the windows of a plain column (see [`GroupSync`]). Moved at once this
+    /// early, they'd go to the new place at the old size and stick out of the group until the
+    /// commit. Otherwise they move at once with this animation.
     InPlace(niri_config::Animation),
 }
 
@@ -464,8 +495,12 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             }
         }
 
-        for col in &mut self.columns {
+        for (col, data) in zip(&mut self.columns, &mut self.data) {
             col.advance_animations();
+            // A group that stopped waiting for its windows at the deadline can change its width.
+            if col.group.is_some() {
+                data.update(col);
+            }
         }
 
         self.closing_windows.retain_mut(|closing| {
@@ -5001,7 +5036,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     view_off + Point::from((col_x, 0.)) + col.render_offset() + col.tiles_origin();
                 let pos = pos.to_physical_precise_round(scale).to_logical(scale);
                 let windows = col.tiles.iter().map(|t| t.window()).collect();
-                Some((group.id(), Rectangle::new(pos, group.size()), windows))
+                // As drawn: a width change shows once the windows commit it.
+                let size = Size::from((col.width(), group.size().h));
+                Some((group.id(), Rectangle::new(pos, size), windows))
             },
         )
     }
@@ -5360,6 +5397,7 @@ impl<W: LayoutElement> Column<W> {
             clock: tile.clock.clone(),
             options,
             group: None,
+            group_sync: None,
             group_home: None,
         };
 
@@ -5396,6 +5434,11 @@ impl<W: LayoutElement> Column<W> {
         options: Rc<Options>,
     ) {
         let mut update_sizes = false;
+
+        // A group's relayout for the new configuration doesn't wait for one in flight.
+        if let Some(sync) = &mut self.group_sync {
+            sync.outdated = true;
+        }
 
         if self.view_size != view_size
             || self.working_area != working_area
@@ -5462,21 +5505,10 @@ impl<W: LayoutElement> Column<W> {
             }
         }
 
-        // Tiles still held in a group when the transaction deadline passed (a slow or hung
-        // client) don't wait any longer: they move to their slots, and resize whenever their
-        // window commits.
-        if self.data.iter().any(|data| data.group_hold.is_some()) {
-            let now = self.clock.now_unadjusted();
-            let config = self.options.animations.window_resize.anim;
-            for idx in 0..self.tiles.len() {
-                if self.data[idx]
-                    .group_hold
-                    .is_some_and(|hold| hold.deadline <= now)
-                {
-                    self.release_slot_hold(idx, config);
-                }
-            }
-        }
+        // A group that waited for its windows past the transaction deadline (a slow or hung
+        // client) doesn't wait any longer: its tiles move to their slots, and resize whenever
+        // their windows commit.
+        self.maybe_finish_group_sync();
 
         for tile in &mut self.tiles {
             tile.advance_animations();
@@ -5489,8 +5521,8 @@ impl<W: LayoutElement> Column<W> {
         self.move_animation.is_some()
             || self.tab_indicator.are_animations_ongoing()
             || self.tiles.iter().any(Tile::are_animations_ongoing)
-            // Keep advancing for the deadline of held tiles.
-            || self.data.iter().any(|data| data.group_hold.is_some())
+            // Keep advancing for the deadline of a group waiting for its windows.
+            || self.group_sync.is_some()
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -5753,16 +5785,10 @@ impl<W: LayoutElement> Column<W> {
 
         // Tiles in a group sit in their slots and don't move with each other's sizes.
         if self.group.is_some() {
-            // A tile held for this commit moves to its slot now, in step with its resize (which
-            // just started in tile.update_window()), like the tiles below a resizing window in a
-            // plain column.
-            if let Some(hold) = self.data[tile_idx].group_hold {
-                let size = self.tiles[tile_idx].tile_size();
-                if size != hold.size {
-                    let config = self.options.animations.window_resize.anim;
-                    self.release_slot_hold(tile_idx, config);
-                }
-            }
+            // Once this was the last window the group waited for, the held tiles move to their
+            // slots, in step with the resizes (which just started in tile.update_window()), like
+            // the tiles below a resizing window in a plain column.
+            self.maybe_finish_group_sync();
             return;
         }
 
@@ -5848,11 +5874,11 @@ impl<W: LayoutElement> Column<W> {
     fn update_tile_sizes_with_transaction(&mut self, animate: bool, transaction: Transaction) {
         if self.group.is_some() {
             let moves = if animate {
-                SlotMoves::Now(self.options.animations.window_resize.anim)
+                SlotMoves::InPlace(self.options.animations.window_resize.anim)
             } else {
                 SlotMoves::Jump
             };
-            self.update_group_sizes(animate, transaction, moves);
+            self.update_group_sizes_with(animate, transaction, moves, true);
             return;
         }
 
@@ -6151,9 +6177,12 @@ impl<W: LayoutElement> Column<W> {
 
     fn width(&self) -> f64 {
         // A group's width is its target width: inside a group, tiles change size together (in one
-        // transaction) while the group keeps its size, and the column actions that change it
-        // animate the neighbouring columns themselves.
+        // transaction) while the group keeps its size. Only a change of the column's width shows
+        // when the windows commit it, like for a plain column (see GroupSync::shown_width).
         if let Some(group) = &self.group {
+            if let Some(width) = self.group_sync.and_then(|sync| sync.shown_width) {
+                return width;
+            }
             return group.size().w;
         }
 
@@ -6885,6 +6914,10 @@ impl<W: LayoutElement> Column<W> {
             if data.group_hold.is_some() {
                 assert!(self.group.is_some(), "only group tiles can be held");
                 assert!(data.group_rect.is_some(), "a held tile must have a slot");
+                assert!(
+                    self.group_sync.is_some(),
+                    "a held tile must wait for the group's windows"
+                );
             }
 
             if matches!(data.height, WindowHeight::Fixed(_)) {
@@ -7061,9 +7094,42 @@ impl<W: LayoutElement> Column<W> {
 
     /// Lays out the group and requests the tile sizes.
     ///
-    /// Tiles whose slot moved go there as `moves` says. A tile whose slot didn't change is left
-    /// as it is (it may still be held from an earlier relayout).
+    /// Tiles whose slot changed go there as `moves` says (see [`GroupSync`]). A tile whose slot
+    /// didn't change is left as it is (it may still be held from an earlier relayout).
     fn update_group_sizes(&mut self, animate: bool, transaction: Transaction, moves: SlotMoves) {
+        self.update_group_sizes_with(animate, transaction, moves, false);
+    }
+
+    /// [`Self::update_group_sizes()`]; `width_change`: this relayout follows a change of the
+    /// column's width, which the strip then shows when the windows commit it (see
+    /// [`GroupSync::shown_width`]).
+    fn update_group_sizes_with(
+        &mut self,
+        animate: bool,
+        transaction: Transaction,
+        moves: SlotMoves,
+        width_change: bool,
+    ) {
+        let now = self.clock.now_unadjusted();
+
+        // An earlier relayout is still on its way to the screen: this one goes out once the
+        // windows caught up with it (or it timed out).
+        // (Only while the tree still has the slots of that layout: a change of the tree always
+        // lays out afresh.)
+        let group = self.group.as_ref().unwrap();
+        let same_slots = group.slot_rects().len() == group.slot_count()
+            && group.filled_count() == self.tiles.len();
+        if matches!(moves, SlotMoves::Jump) && same_slots {
+            if let Some(sync) = &mut self.group_sync {
+                if now < sync.deadline && !sync.outdated {
+                    sync.deferred = Some(sync.deferred.unwrap_or(false) || width_change);
+                    return;
+                }
+            }
+        }
+
+        let shown_width = self.width();
+
         let gaps = self.options.layout.gaps;
         let mins = self.group_min_sizes();
         let width = self.resolve_column_width(self.effective_width());
@@ -7074,39 +7140,95 @@ impl<W: LayoutElement> Column<W> {
         group.layout(Size::from((width.max(min.w).max(1.), height)), gaps, &mins);
         let rects = group.filled_rects();
 
+        // All windows get their sizes in one transaction, so their commits apply on one frame.
+        for (tile, rect) in zip(&mut self.tiles, &rects) {
+            tile.request_tile_size(rect.size, animate, Some(transaction.clone()));
+        }
+        // Whether the group has to wait for windows to commit: then the slots that changed stay
+        // where they are drawn until all of them did.
+        let wait = !matches!(moves, SlotMoves::Now(_))
+            && self
+                .tiles
+                .iter()
+                .any(|tile| tile.window().is_size_request_pending());
+
         let resize_config = self.options.animations.window_resize.anim;
-        let deadline = self.clock.now_unadjusted() + TRANSACTION_TIME_LIMIT;
         for ((tile, data), rect) in zip(zip(&mut self.tiles, &mut self.data), rects) {
             if let Some(old) = data.group_rect.filter(|old| *old != rect) {
                 // Where the layout has the tile now.
                 let shown = data.group_hold.map_or(old.loc, |hold| hold.loc);
-                // Compared with what the window has now: when a pending change is undone (a second
-                // rotate before the commit), the tile is where it belongs already.
-                let size = tile.tile_size();
-                let resizes = (rect.size.w - size.w).abs() > RESIZE_ANIMATION_THRESHOLD
-                    || (rect.size.h - size.h).abs() > RESIZE_ANIMATION_THRESHOLD;
                 match moves {
-                    SlotMoves::InPlace(_) if animate && resizes && shown != rect.loc => {
-                        data.group_hold = Some(SlotHold {
-                            loc: shown,
-                            size,
-                            deadline,
-                        });
+                    SlotMoves::InPlace(_) | SlotMoves::Jump if wait => {
+                        let glide = match moves {
+                            SlotMoves::InPlace(_) if animate => Some(resize_config),
+                            _ => None,
+                        };
+                        data.group_hold = Some(SlotHold { loc: shown, glide });
                     }
                     SlotMoves::InPlace(config) | SlotMoves::Now(config) => {
                         data.group_hold = None;
                         animate_tile_move_from(tile, shown - rect.loc, config, false);
                     }
                     SlotMoves::Jump => {
-                        // A held tile still glides out of its hold rather than jump.
-                        if data.group_hold.take().is_some() {
-                            animate_tile_move_from(tile, shown - rect.loc, resize_config, false);
+                        // A held tile still goes out of its hold as it was going to.
+                        if let Some(SlotHold {
+                            loc,
+                            glide: Some(config),
+                        }) = data.group_hold.take()
+                        {
+                            animate_tile_move_from(tile, loc - rect.loc, config, false);
                         }
                     }
                 }
             }
             data.group_rect = Some(rect);
-            tile.request_tile_size(rect.size, animate, Some(transaction.clone()));
+        }
+
+        if self.data.iter().any(|data| data.group_hold.is_some()) {
+            // Until the windows commit, the group shows the layout it showed so far.
+            let shown_width = self
+                .group_sync
+                .and_then(|sync| sync.shown_width)
+                .or(width_change.then_some(shown_width));
+            self.group_sync = Some(GroupSync {
+                deadline: now + TRANSACTION_TIME_LIMIT,
+                deferred: None,
+                shown_width,
+                outdated: false,
+            });
+        } else {
+            self.group_sync = None;
+        }
+    }
+
+    /// Ends the wait of the group for its windows once they all committed their requested sizes
+    /// or the deadline passed: the held tiles go to their slots, all at once, and a relayout
+    /// that came in meanwhile goes out.
+    fn maybe_finish_group_sync(&mut self) {
+        let Some(sync) = self.group_sync else {
+            return;
+        };
+        if self.clock.now_unadjusted() < sync.deadline
+            && self
+                .tiles
+                .iter()
+                .any(|tile| tile.window().is_size_request_pending())
+        {
+            return;
+        }
+
+        self.group_sync = None;
+        for (tile, data) in zip(&mut self.tiles, &mut self.data) {
+            let (Some(hold), Some(rect)) = (data.group_hold.take(), data.group_rect) else {
+                continue;
+            };
+            if let Some(config) = hold.glide {
+                animate_tile_move_from(tile, hold.loc - rect.loc, config, true);
+            }
+        }
+
+        if let Some(width_change) = sync.deferred {
+            self.update_group_sizes_with(false, Transaction::new(), SlotMoves::Jump, width_change);
         }
     }
 
@@ -7168,6 +7290,7 @@ impl<W: LayoutElement> Column<W> {
     /// Dissolves the group back into a plain column (one tile left).
     fn dissolve_group(&mut self) {
         self.group = None;
+        self.group_sync = None;
         for data in &mut self.data {
             data.height = WindowHeight::auto_1();
             data.group_rect = None;
@@ -7700,6 +7823,10 @@ impl<W: LayoutElement> Column<W> {
                     "plain columns have no slot rects"
                 );
             }
+            assert!(
+                self.group_sync.is_none(),
+                "plain columns don't wait as a group"
+            );
             return;
         };
         assert_eq!(

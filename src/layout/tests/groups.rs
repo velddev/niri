@@ -1620,3 +1620,286 @@ fn swapping_equal_slots_moves_at_once() {
     assert_eq!(r[&1], before[&2]);
     assert_eq!(r[&2], before[&1]);
 }
+
+// -- Resizes wait for every window of the group -----------------------------------------------
+
+/// The windows' sizes as last requested, by window id.
+fn requested(layout: &Layout<TestWindow>) -> HashMap<usize, Size<i32, Logical>> {
+    layout
+        .active_workspace()
+        .unwrap()
+        .tiles_with_render_positions()
+        .map(|(tile, _, _)| (tile.window().0.id, tile.window().requested_size().unwrap()))
+        .collect()
+}
+
+/// Asserts that the drawn slots of a side-by-side pair `a | b` tile the group: `gap` between
+/// them, no more and no less (rounded to physical pixels each).
+fn assert_neighbours(r: &HashMap<usize, Rectangle<f64, Logical>>, a: usize, b: usize, what: &str) {
+    let gap = r[&b].loc.x - right(r[&a]);
+    assert!(
+        (gap - GAPS).abs() <= 1.,
+        "{what}: {gap} px between windows {a} and {b}: {r:?}"
+    );
+}
+
+/// `[1 2]` side by side at full width (1260 px), settled.
+fn side_by_side_pair() -> Layout<TestWindow> {
+    let layout = run(
+        1.,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+        ],
+    );
+    assert_eq!(shape(&layout), "[1 2]");
+    layout
+}
+
+fn crevice_drag_begin() -> [Op; 1] {
+    [Op::InteractiveResizeBegin {
+        window: 1,
+        edges: ResizeEdge::RIGHT,
+    }]
+}
+
+fn crevice_drag_to(dx: f64) -> [Op; 1] {
+    [Op::InteractiveResizeUpdate {
+        window: 1,
+        dx,
+        dy: 0.,
+    }]
+}
+
+#[test]
+fn dragging_a_divider_moves_both_slots_on_the_same_commit() {
+    let mut layout = side_by_side_pair();
+    let before = rects(&layout);
+
+    apply(&mut layout, crevice_drag_begin());
+    apply(&mut layout, crevice_drag_to(100.));
+    // Both windows are asked for their new sizes, in one transaction.
+    let req = requested(&layout);
+    assert_eq!(req[&1].w, 725);
+    assert_eq!(req[&2].w, 525);
+    // Until they commit, the slots stay where the buffers are: window 2 doesn't move to its new
+    // place at its old size (on top of the group's edge), leaving a gap after window 1.
+    assert_eq!(rects(&layout), before);
+
+    // A fast window that committed waits for its slow neighbour. (In niri its commit is held by
+    // the transaction until the neighbour's; the test windows' commits apply at once.)
+    commit(&mut layout, [1]);
+    let r = rects(&layout);
+    assert_eq!(r[&2], before[&2]);
+    assert_eq!(r[&1].loc, before[&1].loc);
+
+    // Then both are at their new places, on the same frame.
+    commit(&mut layout, [2]);
+    let r = rects(&layout);
+    assert_eq!(r[&1].size.w, 725.);
+    assert_eq!(r[&2].size.w, 525.);
+    assert_neighbours(&r, 1, 2, "after both commits");
+    assert_eq!(right(r[&2]), right(before[&2]));
+    apply(&mut layout, [Op::InteractiveResizeEnd { window: 1 }]);
+}
+
+#[test]
+fn a_drag_sends_new_sizes_only_once_the_group_caught_up() {
+    let mut layout = side_by_side_pair();
+
+    apply(&mut layout, crevice_drag_begin());
+    apply(&mut layout, crevice_drag_to(100.));
+    commit(&mut layout, [1]);
+    // The pointer moves on while window 2 still draws its new size: no new sizes go out (they'd
+    // queue up behind window 2's, and window 1 would run ahead of it).
+    apply(&mut layout, crevice_drag_to(150.));
+    apply(&mut layout, crevice_drag_to(200.));
+    let req = requested(&layout);
+    assert_eq!(req[&1].w, 725);
+    assert_eq!(req[&2].w, 525);
+
+    // Once window 2 committed, the newest position goes out, to both.
+    commit(&mut layout, [2]);
+    let req = requested(&layout);
+    assert_eq!(req[&1].w, 825);
+    assert_eq!(req[&2].w, 425);
+    let r = rects(&layout);
+    assert_eq!(r[&1].size.w, 725.);
+    assert_neighbours(&r, 1, 2, "while the next sizes are on their way");
+
+    commit(&mut layout, [2, 1]);
+    apply(&mut layout, [Op::InteractiveResizeEnd { window: 1 }]);
+    more(&mut layout, []);
+    let r = rects(&layout);
+    assert_eq!(r[&1].size.w, 825.);
+    assert_eq!(r[&2].size.w, 425.);
+    assert_neighbours(&r, 1, 2, "settled");
+}
+
+#[test]
+fn a_hung_window_holds_its_neighbours_until_the_transaction_deadline() {
+    let mut options = options(1.);
+    options.animations.off = false;
+    let mut layout = run_animated(
+        options,
+        1.,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+        ],
+    );
+    let before = rects(&layout);
+
+    apply(&mut layout, crevice_drag_begin());
+    apply(&mut layout, crevice_drag_to(100.));
+    commit(&mut layout, [1]);
+    advance(&mut layout, 250);
+    assert_eq!(rects(&layout)[&2], before[&2]);
+    apply(&mut layout, crevice_drag_to(200.));
+    assert_eq!(requested(&layout)[&1].w, 725);
+
+    // Past the 300 ms of the transaction, the group stops waiting: the slots go to the layout
+    // asked for, and the newest drag position goes out.
+    advance(&mut layout, 100);
+    assert_ne!(rects(&layout)[&2].loc, before[&2].loc);
+    assert_eq!(requested(&layout)[&1].w, 825);
+    apply(&mut layout, [Op::InteractiveResizeEnd { window: 1 }]);
+}
+
+/// `[1 2]` side by side at half width with column 3 after it, settled, animated.
+fn side_by_side_pair_and_a_column() -> Layout<TestWindow> {
+    let layout = run_animated(
+        anim_options(0.25),
+        0.25,
+        [
+            window(1),
+            window(2),
+            window(3),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+            Op::SplitWindow { id: None },
+        ],
+    );
+    assert_eq!(shape(&layout), "[1 2] {3}");
+    layout
+}
+
+#[test]
+fn group_width_change_shows_with_the_commits() {
+    let mut layout = side_by_side_pair_and_a_column();
+    let before = drawn(&layout);
+
+    // Mod+R: the group goes from 1/2 to 2/3, both slots get wider.
+    apply(&mut layout, [Op::SwitchPresetColumnWidth]);
+    let req = requested(&layout);
+    assert!(req[&1].w > before[&1].size.w as i32);
+    assert!(req[&2].w > before[&2].size.w as i32);
+    // Nothing moves before the windows commit: not window 2 (it would leave a gap after window
+    // 1 at its old size), not column 3 (it would leave one after the group).
+    advance(&mut layout, 100);
+    assert_eq!(drawn(&layout), before);
+    // One window committed: the group waits for the other. (In niri the transaction holds the
+    // first commit until the second; the test windows' commits apply at once, so no time passes
+    // in between here.)
+    commit(&mut layout, [2]);
+    let r = drawn(&layout);
+    assert_eq!(r[&2].loc, before[&2].loc);
+    assert_eq!(r[&3], before[&3]);
+
+    // Then the slots and column 3 move with the resizes, the gaps holding on every frame.
+    commit(&mut layout, [1]);
+    let mut moved = false;
+    for _ in 0..11 {
+        let r = drawn(&layout);
+        assert_neighbours(&r, 1, 2, "slots");
+        assert_neighbours(&r, 2, 3, "group and column 3");
+        moved |= r[&3].loc.x != before[&3].loc.x;
+        advance(&mut layout, 100);
+    }
+    assert!(moved, "column 3 never moved");
+    more(&mut layout, []);
+    let r = rects(&layout);
+    assert_eq!(drawn(&layout), r);
+    assert_neighbours(&r, 1, 2, "settled slots");
+    assert_neighbours(&r, 2, 3, "settled column 3");
+}
+
+#[test]
+fn group_resizes_ask_every_window_in_one_transaction() {
+    fn assert_one_transaction(layout: &Layout<TestWindow>, what: &str) {
+        let ws = layout.active_workspace().unwrap();
+        let txns: Vec<_> = ws
+            .tiles_with_render_positions()
+            .map(|(tile, _, _)| (tile.window().0.id, tile.window().transaction()))
+            .collect();
+        let (first_id, first) = &txns[0];
+        let first = first
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: window {first_id} has no transaction"));
+        for (id, txn) in &txns[1..] {
+            let txn = txn
+                .as_ref()
+                .unwrap_or_else(|| panic!("{what}: window {id} has no transaction"));
+            assert!(
+                first.is_same(txn),
+                "{what}: windows {first_id} and {id} are in different transactions"
+            );
+        }
+    }
+
+    let mut layout = run(
+        0.25,
+        [
+            window(1),
+            window(2),
+            window(3),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+            Op::SplitWindow { id: None },
+            // [1 2] with 3 beside 2 below it: [1 (2 3)].
+            Op::SplitWindowBeside {
+                id: Some(3),
+                target: 2,
+                side: group::Side::Bottom,
+            },
+        ],
+    );
+    assert_eq!(shape(&layout), "[1 (2 3)]");
+    commit(&mut layout, [1, 2, 3]);
+
+    apply(&mut layout, [Op::SwitchPresetColumnWidth]);
+    assert_one_transaction(&layout, "Mod+R");
+    more(&mut layout, []);
+
+    apply(
+        &mut layout,
+        [
+            Op::InteractiveResizeBegin {
+                window: 1,
+                edges: ResizeEdge::RIGHT,
+            },
+            Op::InteractiveResizeUpdate {
+                window: 1,
+                dx: 50.,
+                dy: 0.,
+            },
+        ],
+    );
+    assert_one_transaction(&layout, "divider drag");
+    apply(&mut layout, [Op::InteractiveResizeEnd { window: 1 }]);
+    more(&mut layout, []);
+
+    apply(
+        &mut layout,
+        [Op::FocusWindow(1), Op::SplitWindow { id: None }],
+    );
+    assert_one_transaction(&layout, "rotate");
+    more(&mut layout, []);
+
+    apply(&mut layout, [Op::CloseWindow(2)]);
+    more(&mut layout, []);
+}
