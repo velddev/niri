@@ -1,7 +1,8 @@
 //! Split groups (docs/wiki/Development:-Split-Groups.md).
 //!
 //! The test output is 1280 x 720 with 10 px gaps: a half-width column is 625 x 700 (tall, so
-//! merges stack), a full-width one 1260 x 700 (wide, so merges go side by side).
+//! merges stack), a full-width one 1260 x 700 (wide, so merges go side by side). A merge of two
+//! columns (`split-window`) spans both: two quarter-width columns make a half-width group.
 
 use std::collections::HashMap;
 
@@ -181,7 +182,7 @@ fn drag(layout: &Layout<TestWindow>, id: usize, x: f64, y: f64) -> Vec<Op> {
 #[test]
 fn split_merges_with_right_neighbour_stacked_in_a_tall_column() {
     let layout = run(
-        0.5,
+        0.25,
         [
             window(1),
             window(2),
@@ -193,7 +194,8 @@ fn split_merges_with_right_neighbour_stacked_in_a_tall_column() {
     assert_eq!(focused(&layout), 1);
 
     let r = rects(&layout);
-    // The group keeps the target column's width; the window takes the top half.
+    // Two quarter-width columns make a half-width group (both columns and the gap between
+    // them), taller than wide: the window takes the top half.
     assert_eq!(r[&1].size, Size::from((625., 345.)));
     assert_eq!(r[&2].size, Size::from((625., 345.)));
     assert_eq!(r[&1].loc.x, r[&2].loc.x);
@@ -226,6 +228,143 @@ fn split_at_the_end_merges_left() {
     assert_eq!(focused(&layout), 2);
 }
 
+/// Two columns of fixed widths (`SetFixed` window widths) with the first focused.
+fn fixed_pair(first: i32, second: i32) -> Vec<Op> {
+    vec![
+        window(1),
+        Op::SetColumnWidth(SizeChange::SetFixed(first)),
+        window(2),
+        Op::SetColumnWidth(SizeChange::SetFixed(second)),
+        Op::FocusColumnFirst,
+    ]
+}
+
+#[test]
+fn split_merge_takes_both_columns_space_side_by_side() {
+    // Mike's 1433 + 1097 on 2560 px, scaled to the test output: the group spans both columns
+    // and the gap between them, so side-by-side windows stay side by side.
+    let mut layout = run(0.5, fixed_pair(600, 400));
+    let before = rects(&layout);
+    assert_eq!(before[&1].size.w, 600.);
+    assert_eq!(before[&2].size.w, 400.);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2]");
+    assert_eq!(focused(&layout), 1);
+    let r = rects(&layout);
+    assert_eq!(r[&1].size, Size::from((500., 700.)));
+    assert_eq!(r[&2].size, Size::from((500., 700.)));
+    assert_eq!(r[&2].loc.x - right(r[&1]), GAPS);
+    // Where both columns were, the source on its own side.
+    assert_eq!(r[&1].loc.x, before[&1].loc.x);
+    assert_eq!(right(r[&2]), right(before[&2]));
+}
+
+#[test]
+fn split_merge_of_proportions_adds_them_up() {
+    let layout = run(
+        0.5,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+        ],
+    );
+    // ½ + ½: the whole view, wide, so side by side.
+    assert_eq!(shape(&layout), "[1 2]");
+    let r = rects(&layout);
+    assert_eq!(r[&1].size, Size::from((625., 700.)));
+    assert_eq!(r[&2].size, Size::from((625., 700.)));
+    assert_eq!(r[&2].loc.x - right(r[&1]), GAPS);
+}
+
+#[test]
+fn split_merge_of_narrow_columns_stacks_in_their_combined_width() {
+    let layout = run(
+        0.5,
+        [fixed_pair(300, 290), vec![Op::SplitWindow { id: None }]].concat(),
+    );
+    // 300 + 10 + 290 = 600 wide, 700 tall: stacked, but as wide as both columns.
+    assert_eq!(shape(&layout), "(1 2)");
+    let r = rects(&layout);
+    assert_eq!(r[&1].size, Size::from((600., 345.)));
+    assert_eq!(r[&2].size, Size::from((600., 345.)));
+}
+
+#[test]
+fn split_merge_of_full_width_columns_caps_at_the_view() {
+    let layout = run(
+        1.,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+        ],
+    );
+    assert_eq!(shape(&layout), "[1 2]");
+    let r = rects(&layout);
+    assert_eq!(r[&1].size, Size::from((625., 700.)));
+    assert_eq!(r[&2].size, Size::from((625., 700.)));
+
+    // Toggled full width counts as the whole view too, and fixed widths past it cap at it.
+    let layout = run(
+        0.5,
+        [
+            window(1),
+            Op::MaximizeColumn,
+            window(2),
+            Op::SetColumnWidth(SizeChange::SetFixed(900)),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+        ],
+    );
+    assert_eq!(shape(&layout), "[1 2]");
+    let r = rects(&layout);
+    assert_eq!(r[&1].size, Size::from((625., 700.)));
+    assert_eq!(r[&2].size, Size::from((625., 700.)));
+}
+
+#[test]
+fn split_merge_at_the_end_mirrors() {
+    // 2 is last: it merges left into 1's column and stays on the right.
+    let mut layout = run(0.5, fixed_pair(400, 600));
+    more(&mut layout, [Op::FocusColumnLast]);
+    let before = rects(&layout);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2]");
+    assert_eq!(focused(&layout), 2);
+    let r = rects(&layout);
+    assert_eq!(r[&1].size, Size::from((500., 700.)));
+    assert_eq!(r[&2].size, Size::from((500., 700.)));
+    assert_eq!(r[&1].loc.x, before[&1].loc.x);
+    assert_eq!(right(r[&2]), right(before[&2]));
+}
+
+#[test]
+fn split_merge_keeps_the_columns_after_in_place() {
+    let mut layout = run(
+        0.5,
+        [
+            window(1),
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            window(2),
+            Op::SetColumnWidth(SizeChange::SetFixed(200)),
+            window(3),
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            Op::FocusColumnFirst,
+        ],
+    );
+    let before = rects(&layout);
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "(1 2) {3}");
+    let r = rects(&layout);
+    assert_eq!(r[&1].size.w, 510.);
+    assert_eq!(r[&3], before[&3]);
+}
+
 #[test]
 fn split_alone_does_nothing() {
     let layout = run(1., [window(1), Op::SplitWindow { id: None }]);
@@ -235,7 +374,7 @@ fn split_alone_does_nothing() {
 #[test]
 fn split_again_rotates_and_back() {
     let mut layout = run(
-        0.5,
+        0.25,
         [
             window(1),
             window(2),
@@ -459,7 +598,7 @@ fn moving_from_a_lone_column_into_a_group_merges() {
 #[test]
 fn moving_up_and_down_swaps_stacked_slots() {
     let mut layout = run(
-        0.5,
+        0.25,
         [
             window(1),
             window(2),
@@ -555,7 +694,7 @@ fn focus_goes_through_slots_first() {
 #[test]
 fn focus_window_or_workspace_leaves_the_group_at_its_edge() {
     let mut layout = run(
-        0.5,
+        0.25,
         [
             window(1),
             window(2),
@@ -698,7 +837,7 @@ fn interactive_resize_inner_edge_moves_the_crevice() {
 #[test]
 fn interactive_resize_outer_edge_resizes_the_group() {
     let mut layout = run(
-        0.5,
+        0.25,
         [
             window(1),
             window(2),
@@ -732,7 +871,7 @@ fn interactive_resize_outer_edge_resizes_the_group() {
 #[test]
 fn edge_resize_zones_offer_inner_edges_only_where_there_is_a_crevice() {
     let layout = run(
-        0.5,
+        0.25,
         [
             window(1),
             window(2),
@@ -830,7 +969,7 @@ fn drag_within_group_onto_other_window_swaps() {
 #[test]
 fn drag_to_column_gap_takes_it_out() {
     let mut layout = run(
-        0.5,
+        0.25,
         [
             window(0),
             window(1),
@@ -968,7 +1107,7 @@ fn fullscreen_goes_alone_and_comes_back() {
 #[test]
 fn fullscreen_in_group_of_two_comes_back() {
     let mut layout = run(
-        0.5,
+        0.25,
         [
             window(1),
             window(2),
@@ -1299,8 +1438,8 @@ fn assert_inside(r: Rectangle<f64, Logical>, area: Rectangle<f64, Logical>, what
 /// The rotate in the stacked group of windows 1 and 2 (1 focused), from a settled state.
 fn stacked_pair_animated() -> Layout<TestWindow> {
     let layout = run_animated(
-        anim_options(0.5),
-        0.5,
+        anim_options(0.25),
+        0.25,
         [
             window(1),
             window(2),
@@ -1318,9 +1457,9 @@ fn merge_moves_the_view_at_once() {
     // column, the group is the only column, so the view must head for the centre right away,
     // not once the windows commit (meanwhile the merged window moved without the view and its
     // neighbour went past its place and back).
-    let mut options = anim_options(0.5);
+    let mut options = anim_options(0.25);
     options.layout.always_center_single_column = true;
-    let mut layout = run_animated(options, 0.5, [window(1), window(2), Op::FocusColumnFirst]);
+    let mut layout = run_animated(options, 0.25, [window(1), window(2), Op::FocusColumnFirst]);
 
     apply(&mut layout, [Op::SplitWindow { id: None }]);
     assert_eq!(shape(&layout), "(1 2)");
@@ -1337,6 +1476,41 @@ fn merge_moves_the_view_at_once() {
     let group = bounds([r[&1], r[&2]]);
     // (Rounded to a physical pixel.)
     assert!((group.loc.x - (1280. - group.size.w) / 2.).abs() <= 0.5);
+}
+
+#[test]
+fn merge_glides_from_where_both_windows_were() {
+    let mut layout = run_animated(
+        anim_options(0.25),
+        0.25,
+        [
+            window(1),
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            window(2),
+            Op::SetColumnWidth(SizeChange::SetFixed(200)),
+            window(3),
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            Op::FocusColumnFirst,
+        ],
+    );
+    let before = drawn(&layout);
+
+    apply(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "(1 2) {3}");
+    // Nothing jumps: both windows start where they were, and the column after the group, whose
+    // place doesn't change, stays put all along (the source column's removal and the group's
+    // growth over its space cancel out).
+    assert_eq!(drawn(&layout), before);
+    commit(&mut layout, [1, 2]);
+    for _ in 0..10 {
+        advance(&mut layout, 100);
+        assert_eq!(drawn(&layout)[&3], before[&3]);
+    }
+    more(&mut layout, []);
+    let r = rects(&layout);
+    assert_eq!(r[&3], before[&3]);
+    assert_eq!(r[&1].loc.x, before[&1].loc.x);
+    assert_eq!(right(r[&2]), right(before[&2]));
 }
 
 #[test]

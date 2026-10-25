@@ -43,10 +43,14 @@ tiles go and what size they get) switches to the tree when `group` is set.
 
 - On a window that is alone in its column, the window merges into the column to its right (at the end of
   the strip: the one to its left).
-  It takes half of that column's area along the area's longer side: a wide column (width ≥ height) splits
-  side by side, a tall one stacked.
+  The group takes the space of both columns: its width is the sum of both columns' widths and the gap
+  between them, capped at the view (two proportions add up, at most 1; a fixed width, or full width,
+  makes a fixed sum, or the whole view if the sum reaches it).
+  The window takes half of that area along its longer side: a wide area (width ≥ height) splits side by
+  side, a tall one stacked, so two side-by-side columns stay side by side.
   The window goes on the side it came from (first when it came from the left, last from the right).
-  The group keeps the target column's width; the merged window's old column closes.
+  The merged window's old column closes; the columns around keep their places.
+- Moving or consuming a lone window into a neighbouring group (below) keeps the group's width.
 - If the target is already a group whose root split has that orientation, the window becomes an equal
   sibling instead of nesting: ⅓ ⅓ ⅓, not ½ ¼ ¼.
   In general, a new sibling in a split of *n* children gets 1/(n+1) and the others keep their relative
