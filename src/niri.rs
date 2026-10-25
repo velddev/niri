@@ -2493,7 +2493,9 @@ impl Niri {
             ScreencopyManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
         let toplevel_export_state =
             ToplevelExportManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
-        let appmenu_state = AppmenuManagerState::new::<State>(&display_handle);
+        // Sandboxed clients don't get to point the shell's menu reader at a D-Bus address.
+        let appmenu_state =
+            AppmenuManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
         let viewporter_state = ViewporterState::new::<State>(&display_handle);
         let background_effect_state = BackgroundEffectState::new::<State>(&display_handle);
         let xdg_foreign_state = XdgForeignState::new::<State>(&display_handle);
