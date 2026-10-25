@@ -264,6 +264,14 @@ pub trait LayoutElement {
     /// Size previously requested through [`LayoutElement::request_size()`].
     fn requested_size(&self) -> Option<Size<i32, Logical>>;
 
+    /// Whether the element has yet to commit the size last requested through
+    /// [`LayoutElement::request_size()`]: the request wasn't sent yet, or the element hasn't acked
+    /// and committed it (a commit held by a transaction counts once it's applied).
+    ///
+    /// This is about the requested size, not the buffer size: an element that commits a different
+    /// size in response to the request has caught up.
+    fn is_size_request_pending(&self) -> bool;
+
     /// Non-fullscreen size that we expect this window has or will shortly have.
     ///
     /// This can be different from [`requested_size()`](LayoutElement::requested_size()). For

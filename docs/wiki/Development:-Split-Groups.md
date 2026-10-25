@@ -164,13 +164,23 @@ out, dissolve) animate tiles from their old positions with `window-movement`, si
 `horizontal-view-movement`.
 
 Moves and resizes run on one timeline, as in a plain column, where windows below a resizing window
-move only once it commits its new size:
+move only once it commits its new size. A relayout asks every window of the group for its new size in
+one transaction, so their commits apply together, on one frame, and the slots wait for all of them:
 
 - In place (rotate, share changes, the window-level size actions, inserting or removing a window
-  inside the group), a slot that changes size stays where it is drawn until its window commits the new
-  size, then moves with `window-resize` together with its resize, so it never sticks out of the group
-  at its old size. Slots that keep their size (a swap) move at once. Nothing waits longer than the
-  configure's transaction (300 ms): then the slot moves anyway and resizes whenever its window commits.
+  inside the group, Mod+R and the other column width changes), the slots that change stay where they
+  are drawn until every window of the group has committed its new size, then all move together with
+  `window-resize`, in step with their resizes, so no slot sticks out of the group at its old size or
+  leaves a gap next to a neighbour that already moved. A change of the group's width shows the same
+  way: the columns beside it and the view follow when the windows commit, as for a plain column. If
+  no window has to change size (a swap of equal slots), the slots move at once.
+- An interactive resize (dragging a divider or the group's edge) and other relayouts without animation
+  (output and scale changes) jump, also all together once every window has committed. While one is
+  on its way, newer ones don't go out: the newest goes out once the windows caught up, like niri's
+  throttling of a window's resizes, so a fast window never runs ahead of a slow neighbour and no
+  stale sizes queue up.
+- Nothing waits longer than the transaction (300 ms): then the slots move anyway and resize whenever
+  their windows commit.
 - When the group's column moves in the strip too (a merge, a pop-out), every slot moves at once.
 - A merge into the active column (or one that replaces it at the same index) moves the view at once,
   not only on the windows' commits.

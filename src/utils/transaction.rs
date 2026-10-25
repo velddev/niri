@@ -131,6 +131,12 @@ impl Transaction {
     pub fn is_last(&self) -> bool {
         Arc::strong_count(&self.inner) == 1
     }
+
+    /// Returns whether `other` is an instance of this same transaction.
+    #[cfg(test)]
+    pub fn is_same(&self, other: &Transaction) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl Drop for Transaction {

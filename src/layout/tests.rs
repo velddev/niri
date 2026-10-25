@@ -31,6 +31,10 @@ struct TestWindowInner {
     bbox: Cell<Rectangle<i32, Logical>>,
     initial_bbox: Rectangle<i32, Logical>,
     requested_size: Cell<Option<Size<i32, Logical>>>,
+    // The requested size the window last acked and committed (in communicate()).
+    committed_request: Cell<Option<Size<i32, Logical>>>,
+    // The transaction of the next configure, like Mapped's transaction_for_next_configure.
+    transaction: RefCell<Option<Transaction>>,
     // Emulates the window ignoring the compositor-provided size.
     forced_size: Cell<Option<Size<i32, Logical>>>,
     min_size: Size<i32, Logical>,
@@ -84,6 +88,8 @@ impl TestWindow {
             bbox: Cell::new(params.bbox),
             initial_bbox: params.bbox,
             requested_size: Cell::new(None),
+            committed_request: Cell::new(None),
+            transaction: RefCell::new(None),
             forced_size: Cell::new(None),
             min_size: params.min_max_size.0,
             max_size: params.min_max_size.1,
@@ -98,8 +104,22 @@ impl TestWindow {
         }))
     }
 
+    /// The transaction of the window's next configure, if any.
+    fn transaction(&self) -> Option<Transaction> {
+        self.0.transaction.borrow().clone()
+    }
+
     fn communicate(&self) -> bool {
         let mut changed = false;
+
+        // The window acks and commits the configure with the last requested size (also when it
+        // picks another size itself): a layout waiting for that commit hears about it.
+        let requested = self.0.requested_size.get();
+        if self.0.committed_request.get() != requested {
+            self.0.committed_request.set(requested);
+            changed = true;
+        }
+        self.0.transaction.replace(None);
 
         let size = self.0.forced_size.get().or(self.0.requested_size.get());
         if let Some(size) = size {
@@ -175,8 +195,12 @@ impl LayoutElement for TestWindow {
         size: Size<i32, Logical>,
         mode: SizingMode,
         _animate: bool,
-        _transaction: Option<Transaction>,
+        transaction: Option<Transaction>,
     ) {
+        if let Some(transaction) = transaction {
+            self.0.transaction.replace(Some(transaction));
+        }
+
         if self.0.requested_size.get() != Some(size) {
             self.0.requested_size.set(Some(size));
             self.0.animate_next_configure.set(true);
@@ -243,6 +267,10 @@ impl LayoutElement for TestWindow {
 
     fn requested_size(&self) -> Option<Size<i32, Logical>> {
         self.0.requested_size.get()
+    }
+
+    fn is_size_request_pending(&self) -> bool {
+        self.0.requested_size.get() != self.0.committed_request.get()
     }
 
     fn is_windowed_fullscreen(&self) -> bool {

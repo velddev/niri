@@ -239,6 +239,11 @@ impl LayoutElement for TestWindow {
         self.inner.borrow().requested_size
     }
 
+    fn is_size_request_pending(&self) -> bool {
+        // The visual tests lay out windows that already communicated; nothing waits for them.
+        false
+    }
+
     fn is_child_of(&self, _parent: &Self) -> bool {
         false
     }
