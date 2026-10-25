@@ -1980,7 +1980,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         {
             let source = &self.columns[source_col_idx];
             if source.pending_sizing_mode().is_normal() && source.sizing_mode().is_normal() {
-                self.merge_column_into(source_col_idx, source_col_idx - 1);
+                self.merge_column_into(source_col_idx, source_col_idx - 1, false);
             }
             return;
         }
@@ -2105,7 +2105,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         {
             let source = &self.columns[source_col_idx];
             if source.pending_sizing_mode().is_normal() && source.sizing_mode().is_normal() {
-                self.merge_column_into(source_col_idx, source_col_idx + 1);
+                self.merge_column_into(source_col_idx, source_col_idx + 1, false);
             }
             return;
         }
@@ -2199,7 +2199,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 return;
             }
             if source.tiles.len() == 1 {
-                self.merge_column_into(source_column_idx, target_column_idx);
+                self.merge_column_into(source_column_idx, target_column_idx, false);
             } else {
                 let old_pos = self.tile_strip_pos(source_column_idx, 0);
                 let removed =
@@ -4407,15 +4407,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         {
             return;
         }
-        self.merge_column_into(col_idx, target);
+        self.merge_column_into(col_idx, target, true);
     }
 
     /// Merges the lone window of column `source` into column `target` by the split rule.
-    fn merge_column_into(&mut self, source: usize, target: usize) {
+    ///
+    /// `widen`: the group takes the space of both columns (`split-window`): its width becomes the
+    /// sum of both widths and the gap between them, capped at the view, and the split rule picks
+    /// the orientation from that area. Otherwise the target keeps its width.
+    fn merge_column_into(&mut self, source: usize, target: usize, widen: bool) {
         debug_assert_eq!(self.columns[source].tiles.len(), 1);
         let old_pos = self.tile_strip_pos(source, 0);
         let was_active = self.active_column_idx == source;
         let from_start = source < target;
+        let source_width = widen.then(|| self.columns[source].effective_width());
 
         if was_active {
             self.activate_prev_column_on_removal = None;
@@ -4428,9 +4433,31 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             Some(self.options.animations.window_movement.0),
         );
         let target = if source < target { target - 1 } else { target };
+        let prev_width = self.data[target].width;
         let col = &mut self.columns[target];
+        if let Some(width) = source_width {
+            col.widen_for_merge(width);
+        }
         let idx = col.merge_tile(removed.tile, from_start);
         self.data[target].update(&self.columns[target]);
+
+        if widen {
+            // The group grows over the source's space, which the columns next to it are animating
+            // out of (the removal): they glide from where they are drawn, by the same animation.
+            let growth = self.data[target].width - prev_width;
+            if growth != 0. {
+                let config = self.options.animations.window_movement.0;
+                if self.active_column_idx <= target {
+                    for col in &mut self.columns[target + 1..] {
+                        col.animate_move_from_with_config(-growth, config);
+                    }
+                } else {
+                    for col in &mut self.columns[..=target] {
+                        col.animate_move_from_with_config(growth, config);
+                    }
+                }
+            }
+        }
 
         if was_active {
             self.columns[target].activate_idx(idx);
@@ -6953,12 +6980,58 @@ impl<W: LayoutElement> Column<W> {
         if let Some(group) = &self.group {
             return group.size().w;
         }
-        let width = if self.is_full_width || self.is_pending_maximized {
+        f64::max(1., self.resolve_column_width(self.effective_width()))
+    }
+
+    /// The column's width setting in effect: full width (or maximized) counts as the whole view.
+    fn effective_width(&self) -> ColumnWidth {
+        if self.is_full_width || self.is_pending_maximized {
             ColumnWidth::Proportion(1.)
         } else {
             self.width
+        }
+    }
+
+    /// Width of the area a merge splits: what the next layout gives the column (for a group, its
+    /// width setting rather than the last layout's size, which a merge may just have changed).
+    fn merge_area_width(&self) -> f64 {
+        let width = self.resolve_column_width(self.effective_width());
+        let min = match &self.group {
+            Some(group) => {
+                group
+                    .min_size(self.options.layout.gaps, &self.group_min_sizes())
+                    .w
+            }
+            None => 0.,
         };
-        f64::max(1., self.resolve_column_width(width))
+        width.max(min).max(1.)
+    }
+
+    /// Makes this column take the space of another column of width `other` merging into it: the
+    /// sum of both widths and the gap between them, capped at the view. Two proportions add up
+    /// (at most 1); otherwise the result is fixed pixels, or the whole view if it reaches it.
+    fn widen_for_merge(&mut self, other: ColumnWidth) {
+        let own = self.effective_width();
+        let width = match (own, other) {
+            (ColumnWidth::Proportion(a), ColumnWidth::Proportion(b)) => {
+                ColumnWidth::Proportion(f64::min(a + b, 1.))
+            }
+            _ => {
+                let full = self.resolve_column_width(ColumnWidth::Proportion(1.));
+                let sum = self.resolve_column_width(own)
+                    + self.options.layout.gaps
+                    + self.resolve_column_width(other);
+                if sum >= full {
+                    ColumnWidth::Proportion(1.)
+                } else {
+                    ColumnWidth::Fixed(sum)
+                }
+            }
+        };
+        self.width = width;
+        self.preset_width_idx = None;
+        self.is_full_width = false;
+        self.is_pending_maximized = false;
     }
 
     /// Height of a group's area: the working area minus the gaps above and below.
@@ -6993,12 +7066,7 @@ impl<W: LayoutElement> Column<W> {
     fn update_group_sizes(&mut self, animate: bool, transaction: Transaction, moves: SlotMoves) {
         let gaps = self.options.layout.gaps;
         let mins = self.group_min_sizes();
-        let width = if self.is_full_width || self.is_pending_maximized {
-            ColumnWidth::Proportion(1.)
-        } else {
-            self.width
-        };
-        let width = self.resolve_column_width(width);
+        let width = self.resolve_column_width(self.effective_width());
         let height = self.group_height();
 
         let group = self.group.as_mut().unwrap();
@@ -7142,7 +7210,7 @@ impl<W: LayoutElement> Column<W> {
     /// its longer side, on the side it came from (`from_start`: from the left). Returns the tile
     /// index.
     fn merge_tile(&mut self, tile: Tile<W>, from_start: bool) -> usize {
-        let kind = SplitKind::for_area(self.target_width(), self.group_height());
+        let kind = SplitKind::for_area(self.merge_area_width(), self.group_height());
         let side = match (kind, from_start) {
             (SplitKind::SideBySide, true) => Side::Left,
             (SplitKind::SideBySide, false) => Side::Right,
