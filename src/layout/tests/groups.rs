@@ -1285,6 +1285,118 @@ proptest! {
     }
 }
 
+/// Ops weighted towards the ways a window leaves a group (closing, unmapping, going to another
+/// workspace or output, floating, fullscreen, maximize, consume/expel, moves, tabbed, drags that
+/// end elsewhere or never), interleaved with merges, so a group left with one window shows up.
+fn group_exit_ops() -> impl Strategy<Value = Vec<Op>> {
+    let one = |op: Op| vec![op];
+    let id = || 1..=5usize;
+    let drag = (
+        id(),
+        (0f64..1280., 0f64..720.),
+        (0f64..1280., 0f64..720.),
+        1..=2usize,
+        0..3u8,
+    )
+        .prop_map(|(window, (px, py), (x, y), output_idx, end)| {
+            let mut ops = vec![
+                Op::InteractiveMoveBegin {
+                    window,
+                    output_idx: 1,
+                    px,
+                    py,
+                },
+                Op::InteractiveMoveUpdate {
+                    window,
+                    dx: 300.,
+                    dy: 300.,
+                    output_idx,
+                    px: x,
+                    py: y,
+                },
+            ];
+            match end {
+                0 => ops.push(Op::InteractiveMoveEnd { window }),
+                1 => ops.push(Op::CloseWindow(window)),
+                _ => (),
+            }
+            ops
+        });
+    prop_oneof![
+        4 => any::<Op>().prop_map(one),
+        4 => id().prop_map(move |id| one(Op::AddWindow {
+            params: TestWindowParams::new(id)
+        })),
+        6 => proptest::option::of(id()).prop_map(move |id| one(Op::SplitWindow { id })),
+        1 => proptest::option::of(id()).prop_map(move |id| one(Op::UnsplitWindow { id })),
+        2 => (proptest::option::of(id()), id(), arbitrary_split_side())
+            .prop_map(move |(id, target, side)| one(Op::SplitWindowBeside { id, target, side })),
+        3 => id().prop_map(move |id| one(Op::CloseWindow(id))),
+        2 => (proptest::option::of(id()), 0..=2usize).prop_map(move |(window_id, workspace_idx)| {
+            one(Op::MoveWindowToWorkspace {
+                window_id,
+                workspace_idx,
+            })
+        }),
+        1 => (proptest::option::of(id()), 1..=2usize).prop_map(move |(window_id, output_id)| {
+            one(Op::MoveWindowToOutput {
+                window_id,
+                output_id,
+                target_ws_idx: None,
+            })
+        }),
+        2 => proptest::option::of(id()).prop_map(move |id| one(Op::ToggleWindowFloating { id })),
+        1 => id().prop_map(move |id| one(Op::FullscreenWindow(id))),
+        1 => proptest::option::of(id()).prop_map(move |id| one(Op::MaximizeWindowToEdges { id })),
+        1 => Just(one(Op::MaximizeColumn)),
+        2 => proptest::option::of(id())
+            .prop_map(move |id| one(Op::ConsumeOrExpelWindowLeft { id })),
+        2 => proptest::option::of(id())
+            .prop_map(move |id| one(Op::ConsumeOrExpelWindowRight { id })),
+        1 => Just(one(Op::ConsumeWindowIntoColumn)),
+        1 => Just(one(Op::ExpelWindowFromColumn)),
+        1 => Just(one(Op::MoveColumnLeft)),
+        1 => Just(one(Op::MoveColumnRight)),
+        1 => Just(one(Op::MoveWindowUp)),
+        1 => Just(one(Op::MoveWindowDown)),
+        1 => Just(one(Op::ToggleColumnTabbedDisplay)),
+        1 => Just(one(Op::FocusColumnLeft)),
+        1 => Just(one(Op::FocusColumnRight)),
+        1 => Just(one(Op::FocusWorkspaceDown)),
+        1 => Just(one(Op::FocusWorkspaceUp)),
+        1 => Just(one(Op::AddOutput(2))),
+        1 => Just(one(Op::RemoveOutput(2))),
+        2 => id().prop_map(move |id| one(Op::Communicate(id))),
+        2 => (0..400i32).prop_map(move |msec_delta| one(Op::AdvanceAnimations { msec_delta })),
+        2 => drag,
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if std::env::var_os("RUN_SLOW_TESTS").is_none() {
+            64
+        } else {
+            ProptestConfig::default().cases
+        },
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn random_group_exits_keep_invariants(
+        ops in prop::collection::vec(group_exit_ops(), 0..60),
+        wide in any::<bool>(),
+        animated in any::<bool>(),
+    ) {
+        let mut all = vec![Op::AddOutput(1)];
+        all.extend(ops.into_iter().flatten());
+        all.push(Op::CompleteAnimations);
+        let width = if wide { 1. } else { 0.5 };
+        let options = if animated { anim_options(width) } else { options(width) };
+        check_ops_with_options(options, all);
+    }
+}
+
 #[test]
 fn zero_width_column_merges_without_panicking() {
     let ops = [
