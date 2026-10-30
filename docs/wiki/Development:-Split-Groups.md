@@ -41,8 +41,13 @@ tiles go and what size they get) switches to the tree when `group` is set.
 
 `split-window` (Mod+S):
 
-- On a window that is alone in its column, the window merges into the column to its right (at the end of
-  the strip: the one to its left).
+- On a window that is alone in its column, the window merges into a neighbouring column you can see: the
+  one to its right if any of it is on screen (once the view gets where it's going), else the one to its
+  left if any of that is.
+  With neither on screen (the window fills the view), it pairs with a neighbour that is a single window
+  too, the right one first; an off-screen group or stack is never pulled in, so Mod+S on the only window
+  you see never makes a group of three. With no such neighbour, nothing happens.
+  Neighbours that can't take a window (tabbed, fullscreen, maximized) are skipped.
   The group takes the space of both columns: its width is the sum of both columns' widths and the gap
   between them, capped at the view (two proportions add up, at most 1; a fixed width, or full width,
   makes a fixed sum, or the whole view if the sum reaches it).
@@ -65,7 +70,7 @@ tiles go and what size they get) switches to the tree when `group` is set.
 - On a window in a plain stacked column, `split-window` turns the stack into a group and rotates it: the
   windows go side by side.
 - Tabbed columns are never merged or rotated (the action does nothing), and a lone window with no
-  neighbour has nothing to merge with.
+  neighbour it can merge with (above) stays alone.
 
 Flattening happens on removal: when a split is left with one child, the child takes its place, and a child
 split with the same orientation as its new parent is spliced into the parent (shares multiplied).

@@ -4426,23 +4426,46 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        // A lone window merges with the column to its right, or at the end of the strip, the
-        // one to its left.
-        let target = if col_idx + 1 < self.columns.len() {
-            col_idx + 1
-        } else if col_idx > 0 {
-            col_idx - 1
-        } else {
-            return;
-        };
-        let t = &self.columns[target];
-        if t.display_mode == ColumnDisplay::Tabbed
-            || !t.pending_sizing_mode().is_normal()
-            || !t.sizing_mode().is_normal()
-        {
-            return;
+        // A lone window merges with a neighbouring column.
+        if let Some(target) = self.merge_target(col_idx) {
+            self.merge_column_into(col_idx, target, true);
         }
-        self.merge_column_into(col_idx, target, true);
+    }
+
+    /// The column that the lone window of column `col_idx` merges with on `split-window`: the
+    /// one to its right if any of it is on screen, else the one to its left if any of that is.
+    /// With neither on screen (the window fills the view), a neighbour that is a single window
+    /// too, the right one first: a merge never pulls in a group or a stack nobody can see.
+    ///
+    /// Neighbours that can't take a window (tabbed, fullscreen, maximized) are skipped.
+    fn merge_target(&self, col_idx: usize) -> Option<usize> {
+        let right = (col_idx + 1 < self.columns.len()).then_some(col_idx + 1);
+        let left = col_idx.checked_sub(1);
+        let candidates = [right, left].into_iter().flatten().filter(|&idx| {
+            let col = &self.columns[idx];
+            col.display_mode != ColumnDisplay::Tabbed
+                && col.pending_sizing_mode().is_normal()
+                && col.sizing_mode().is_normal()
+        });
+
+        candidates
+            .clone()
+            .find(|&idx| self.column_on_screen_width(idx) >= 1.)
+            .or_else(|| {
+                candidates.clone().find(|&idx| {
+                    let col = &self.columns[idx];
+                    col.group.is_none() && col.tiles.len() == 1
+                })
+            })
+    }
+
+    /// How much of column `idx` is on screen once the view gets where it's going.
+    fn column_on_screen_width(&self, idx: usize) -> f64 {
+        let view_x = self.target_view_pos();
+        let x = self.column_x(idx);
+        let start = f64::max(x, view_x);
+        let end = f64::min(x + self.data[idx].width, view_x + self.view_size.w);
+        f64::max(0., end - start)
     }
 
     /// Merges the lone window of column `source` into column `target` by the split rule.
