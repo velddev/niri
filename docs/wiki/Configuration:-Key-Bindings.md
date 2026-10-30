@@ -423,7 +423,7 @@ binds {
 #### `split-window`, `unsplit-window`
 
 `split-window` puts the focused window into a *split group*: a column whose windows sit side by side or stacked in a grid of slots.
-On a window alone in its column, it merges the window with the column to its right (at the end of the strip, the one to its left): the group spans both columns (their widths and the gap between them, at most the view), and the window takes half of that area along its longer side.
+On a window alone in its column, it merges the window with the neighbouring column on screen, the right one first (with neither on screen, with a neighbour that is a single window too, so it never pulls in a group you can't see): the group spans both columns (their widths and the gap between them, at most the view), and the window takes half of that area along its longer side.
 On a window already in a group, it rotates the window's split between side by side and stacked.
 
 `unsplit-window` pops the focused window out of its group into its own column next to the group.

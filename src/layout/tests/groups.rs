@@ -371,6 +371,154 @@ fn split_alone_does_nothing() {
     assert_eq!(shape(&layout), "{1}");
 }
 
+/// Window ids on screen, by their rectangles.
+fn on_screen(layout: &Layout<TestWindow>) -> Vec<usize> {
+    let mut ids: Vec<usize> = rects(layout)
+        .into_iter()
+        .filter(|(_, r)| right(*r) > 1. && r.loc.x < 1279.)
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `[1 2]` (a full-width group of two half-width columns) and full-width 3 after it, focused.
+fn group_then_full_width_window() -> Vec<Op> {
+    vec![
+        window(1),
+        window(2),
+        Op::FocusColumnFirst,
+        Op::SplitWindow { id: None },
+        window(3),
+        Op::SetColumnWidth(SizeChange::SetProportion(100.)),
+    ]
+}
+
+#[test]
+fn split_of_the_only_window_on_screen_leaves_an_offscreen_group_alone() {
+    // The report: "it splits three windows when only one window is visible". Mod+S on 3 used to
+    // merge it into the group of two on its left, off screen: a group of three.
+    let mut layout = run(0.5, group_then_full_width_window());
+    assert_eq!(shape(&layout), "[1 2] {3}");
+    assert_eq!(on_screen(&layout), [3]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2] {3}");
+    assert_eq!(focused(&layout), 3);
+}
+
+#[test]
+fn split_of_the_only_window_on_screen_pairs_with_a_lone_neighbour_over_a_group() {
+    // {4} {3} [1 2], full width, 3 focused and alone on screen: the group on its right is
+    // skipped for the lone window on its left.
+    let mut layout = run(1., [window(4), window(3), window(1), window(2)]);
+    more(
+        &mut layout,
+        [
+            Op::FocusWindow(1),
+            Op::SplitWindow { id: None },
+            Op::FocusWindow(3),
+        ],
+    );
+    assert_eq!(shape(&layout), "{4} {3} [1 2]");
+    assert_eq!(on_screen(&layout), [3]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[4 3] [1 2]");
+    assert_eq!(focused(&layout), 3);
+}
+
+#[test]
+fn split_of_the_only_window_on_screen_leaves_an_offscreen_stack_alone() {
+    // {1} {2 3}: 1 full width; the stack would turn into a group of three.
+    let mut layout = run(
+        1.,
+        [
+            window(1),
+            window(2),
+            window(3),
+            Op::ConsumeOrExpelWindowLeft { id: None },
+            Op::FocusColumnFirst,
+        ],
+    );
+    assert_eq!(shape(&layout), "{1} {2 3}");
+    assert_eq!(on_screen(&layout), [1]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "{1} {2 3}");
+}
+
+#[test]
+fn split_of_the_only_window_on_screen_still_pairs_with_a_lone_neighbour() {
+    // Two full-width windows: the right one is off screen, but it's one window, so they pair.
+    let layout = run(
+        1.,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+        ],
+    );
+    assert_eq!(shape(&layout), "[1 2]");
+}
+
+#[test]
+fn split_prefers_the_neighbour_on_screen() {
+    // {1} {2} {3}, half width each, the view on 1 and 2: Mod+S on 2 merges with 1 (on screen),
+    // not with 3 (off screen), though 3 is on the right.
+    let mut layout = run(0.5, [window(1), window(2), window(3)]);
+    // One at a time: each focus moves the view by the windows' committed sizes.
+    more(&mut layout, [Op::FocusColumnFirst]);
+    more(&mut layout, [Op::FocusColumnRight]);
+    assert_eq!(on_screen(&layout), [1, 2]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2] {3}");
+    assert_eq!(focused(&layout), 2);
+}
+
+#[test]
+fn split_next_to_a_group_on_screen_merges_as_a_third() {
+    // Half-width 3 after the full-width group [1 2]: the group's right half (2) is on screen, so
+    // Mod+S merges 3 into it, as an equal sibling.
+    let mut layout = run(
+        0.5,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+            window(3),
+        ],
+    );
+    assert_eq!(on_screen(&layout), [2, 3]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2 3]");
+}
+
+#[test]
+fn split_skips_a_neighbour_that_cant_take_a_window() {
+    // {4} {3} {1 2}, the last one tabbed: Mod+S on 3 skips it (on screen, on the right) for 4.
+    let mut layout = run(
+        0.5,
+        [
+            window(4),
+            window(3),
+            window(1),
+            window(2),
+            Op::ConsumeOrExpelWindowLeft { id: None },
+            Op::ToggleColumnTabbedDisplay,
+            Op::FocusColumnLeft,
+        ],
+    );
+    assert_eq!(shape(&layout), "{4} {3} {1 2}");
+    assert_eq!(focused(&layout), 3);
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[4 3] {1 2}");
+}
+
 #[test]
 fn split_again_rotates_and_back() {
     let mut layout = run(
