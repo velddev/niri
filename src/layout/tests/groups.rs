@@ -371,6 +371,154 @@ fn split_alone_does_nothing() {
     assert_eq!(shape(&layout), "{1}");
 }
 
+/// Window ids on screen, by their rectangles.
+fn on_screen(layout: &Layout<TestWindow>) -> Vec<usize> {
+    let mut ids: Vec<usize> = rects(layout)
+        .into_iter()
+        .filter(|(_, r)| right(*r) > 1. && r.loc.x < 1279.)
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `[1 2]` (a full-width group of two half-width columns) and full-width 3 after it, focused.
+fn group_then_full_width_window() -> Vec<Op> {
+    vec![
+        window(1),
+        window(2),
+        Op::FocusColumnFirst,
+        Op::SplitWindow { id: None },
+        window(3),
+        Op::SetColumnWidth(SizeChange::SetProportion(100.)),
+    ]
+}
+
+#[test]
+fn split_of_the_only_window_on_screen_leaves_an_offscreen_group_alone() {
+    // The report: "it splits three windows when only one window is visible". Mod+S on 3 used to
+    // merge it into the group of two on its left, off screen: a group of three.
+    let mut layout = run(0.5, group_then_full_width_window());
+    assert_eq!(shape(&layout), "[1 2] {3}");
+    assert_eq!(on_screen(&layout), [3]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2] {3}");
+    assert_eq!(focused(&layout), 3);
+}
+
+#[test]
+fn split_of_the_only_window_on_screen_pairs_with_a_lone_neighbour_over_a_group() {
+    // {4} {3} [1 2], full width, 3 focused and alone on screen: the group on its right is
+    // skipped for the lone window on its left.
+    let mut layout = run(1., [window(4), window(3), window(1), window(2)]);
+    more(
+        &mut layout,
+        [
+            Op::FocusWindow(1),
+            Op::SplitWindow { id: None },
+            Op::FocusWindow(3),
+        ],
+    );
+    assert_eq!(shape(&layout), "{4} {3} [1 2]");
+    assert_eq!(on_screen(&layout), [3]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[4 3] [1 2]");
+    assert_eq!(focused(&layout), 3);
+}
+
+#[test]
+fn split_of_the_only_window_on_screen_leaves_an_offscreen_stack_alone() {
+    // {1} {2 3}: 1 full width; the stack would turn into a group of three.
+    let mut layout = run(
+        1.,
+        [
+            window(1),
+            window(2),
+            window(3),
+            Op::ConsumeOrExpelWindowLeft { id: None },
+            Op::FocusColumnFirst,
+        ],
+    );
+    assert_eq!(shape(&layout), "{1} {2 3}");
+    assert_eq!(on_screen(&layout), [1]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "{1} {2 3}");
+}
+
+#[test]
+fn split_of_the_only_window_on_screen_still_pairs_with_a_lone_neighbour() {
+    // Two full-width windows: the right one is off screen, but it's one window, so they pair.
+    let layout = run(
+        1.,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+        ],
+    );
+    assert_eq!(shape(&layout), "[1 2]");
+}
+
+#[test]
+fn split_prefers_the_neighbour_on_screen() {
+    // {1} {2} {3}, half width each, the view on 1 and 2: Mod+S on 2 merges with 1 (on screen),
+    // not with 3 (off screen), though 3 is on the right.
+    let mut layout = run(0.5, [window(1), window(2), window(3)]);
+    // One at a time: each focus moves the view by the windows' committed sizes.
+    more(&mut layout, [Op::FocusColumnFirst]);
+    more(&mut layout, [Op::FocusColumnRight]);
+    assert_eq!(on_screen(&layout), [1, 2]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2] {3}");
+    assert_eq!(focused(&layout), 2);
+}
+
+#[test]
+fn split_next_to_a_group_on_screen_merges_as_a_third() {
+    // Half-width 3 after the full-width group [1 2]: the group's right half (2) is on screen, so
+    // Mod+S merges 3 into it, as an equal sibling.
+    let mut layout = run(
+        0.5,
+        [
+            window(1),
+            window(2),
+            Op::FocusColumnFirst,
+            Op::SplitWindow { id: None },
+            window(3),
+        ],
+    );
+    assert_eq!(on_screen(&layout), [2, 3]);
+
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[1 2 3]");
+}
+
+#[test]
+fn split_skips_a_neighbour_that_cant_take_a_window() {
+    // {4} {3} {1 2}, the last one tabbed: Mod+S on 3 skips it (on screen, on the right) for 4.
+    let mut layout = run(
+        0.5,
+        [
+            window(4),
+            window(3),
+            window(1),
+            window(2),
+            Op::ConsumeOrExpelWindowLeft { id: None },
+            Op::ToggleColumnTabbedDisplay,
+            Op::FocusColumnLeft,
+        ],
+    );
+    assert_eq!(shape(&layout), "{4} {3} {1 2}");
+    assert_eq!(focused(&layout), 3);
+    more(&mut layout, [Op::SplitWindow { id: None }]);
+    assert_eq!(shape(&layout), "[4 3] {1 2}");
+}
+
 #[test]
 fn split_again_rotates_and_back() {
     let mut layout = run(
@@ -1273,6 +1421,118 @@ proptest! {
     #[test]
     fn random_group_operations_keep_invariants(
         ops in prop::collection::vec(group_ops(), 0..50),
+        wide in any::<bool>(),
+        animated in any::<bool>(),
+    ) {
+        let mut all = vec![Op::AddOutput(1)];
+        all.extend(ops.into_iter().flatten());
+        all.push(Op::CompleteAnimations);
+        let width = if wide { 1. } else { 0.5 };
+        let options = if animated { anim_options(width) } else { options(width) };
+        check_ops_with_options(options, all);
+    }
+}
+
+/// Ops weighted towards the ways a window leaves a group (closing, unmapping, going to another
+/// workspace or output, floating, fullscreen, maximize, consume/expel, moves, tabbed, drags that
+/// end elsewhere or never), interleaved with merges, so a group left with one window shows up.
+fn group_exit_ops() -> impl Strategy<Value = Vec<Op>> {
+    let one = |op: Op| vec![op];
+    let id = || 1..=5usize;
+    let drag = (
+        id(),
+        (0f64..1280., 0f64..720.),
+        (0f64..1280., 0f64..720.),
+        1..=2usize,
+        0..3u8,
+    )
+        .prop_map(|(window, (px, py), (x, y), output_idx, end)| {
+            let mut ops = vec![
+                Op::InteractiveMoveBegin {
+                    window,
+                    output_idx: 1,
+                    px,
+                    py,
+                },
+                Op::InteractiveMoveUpdate {
+                    window,
+                    dx: 300.,
+                    dy: 300.,
+                    output_idx,
+                    px: x,
+                    py: y,
+                },
+            ];
+            match end {
+                0 => ops.push(Op::InteractiveMoveEnd { window }),
+                1 => ops.push(Op::CloseWindow(window)),
+                _ => (),
+            }
+            ops
+        });
+    prop_oneof![
+        4 => any::<Op>().prop_map(one),
+        4 => id().prop_map(move |id| one(Op::AddWindow {
+            params: TestWindowParams::new(id)
+        })),
+        6 => proptest::option::of(id()).prop_map(move |id| one(Op::SplitWindow { id })),
+        1 => proptest::option::of(id()).prop_map(move |id| one(Op::UnsplitWindow { id })),
+        2 => (proptest::option::of(id()), id(), arbitrary_split_side())
+            .prop_map(move |(id, target, side)| one(Op::SplitWindowBeside { id, target, side })),
+        3 => id().prop_map(move |id| one(Op::CloseWindow(id))),
+        2 => (proptest::option::of(id()), 0..=2usize).prop_map(move |(window_id, workspace_idx)| {
+            one(Op::MoveWindowToWorkspace {
+                window_id,
+                workspace_idx,
+            })
+        }),
+        1 => (proptest::option::of(id()), 1..=2usize).prop_map(move |(window_id, output_id)| {
+            one(Op::MoveWindowToOutput {
+                window_id,
+                output_id,
+                target_ws_idx: None,
+            })
+        }),
+        2 => proptest::option::of(id()).prop_map(move |id| one(Op::ToggleWindowFloating { id })),
+        1 => id().prop_map(move |id| one(Op::FullscreenWindow(id))),
+        1 => proptest::option::of(id()).prop_map(move |id| one(Op::MaximizeWindowToEdges { id })),
+        1 => Just(one(Op::MaximizeColumn)),
+        2 => proptest::option::of(id())
+            .prop_map(move |id| one(Op::ConsumeOrExpelWindowLeft { id })),
+        2 => proptest::option::of(id())
+            .prop_map(move |id| one(Op::ConsumeOrExpelWindowRight { id })),
+        1 => Just(one(Op::ConsumeWindowIntoColumn)),
+        1 => Just(one(Op::ExpelWindowFromColumn)),
+        1 => Just(one(Op::MoveColumnLeft)),
+        1 => Just(one(Op::MoveColumnRight)),
+        1 => Just(one(Op::MoveWindowUp)),
+        1 => Just(one(Op::MoveWindowDown)),
+        1 => Just(one(Op::ToggleColumnTabbedDisplay)),
+        1 => Just(one(Op::FocusColumnLeft)),
+        1 => Just(one(Op::FocusColumnRight)),
+        1 => Just(one(Op::FocusWorkspaceDown)),
+        1 => Just(one(Op::FocusWorkspaceUp)),
+        1 => Just(one(Op::AddOutput(2))),
+        1 => Just(one(Op::RemoveOutput(2))),
+        2 => id().prop_map(move |id| one(Op::Communicate(id))),
+        2 => (0..400i32).prop_map(move |msec_delta| one(Op::AdvanceAnimations { msec_delta })),
+        2 => drag,
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if std::env::var_os("RUN_SLOW_TESTS").is_none() {
+            64
+        } else {
+            ProptestConfig::default().cases
+        },
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn random_group_exits_keep_invariants(
+        ops in prop::collection::vec(group_exit_ops(), 0..60),
         wide in any::<bool>(),
         animated in any::<bool>(),
     ) {
