@@ -32,6 +32,11 @@ pub struct WindowProperties {
     /// xdg-desktop-portal-gnome's window list is missing icons.
     #[zvariant(rename = "app-id")]
     pub app_id: String,
+    /// Milliseconds since the window was last focused, `u32::MAX` if it never was.
+    ///
+    /// xdg-desktop-portal-gnome's window picker lists the most recently used windows first by it.
+    #[zvariant(rename = "time-since-user-time")]
+    pub time_since_user_time: u32,
 }
 
 #[interface(name = "org.gnome.Shell.Introspect")]

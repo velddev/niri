@@ -2315,11 +2315,17 @@ impl State {
             gnome_shell_introspect::WindowProperties {
                 title: String::from("niri Dynamic Cast Target"),
                 app_id: String::from("rs.bxt.niri.desktop"),
+                time_since_user_time: u32::MAX,
             },
         );
 
+        let now = get_monotonic_time();
         self.niri.layout.with_windows(|mapped, _, _, _| {
             let id = mapped.id().get();
+            let time_since_user_time = mapped.get_focus_timestamp().map_or(u32::MAX, |stamp| {
+                let ms = now.saturating_sub(stamp).as_millis();
+                u32::try_from(ms).unwrap_or(u32::MAX - 1).min(u32::MAX - 1)
+            });
             let props = with_toplevel_role(mapped.toplevel(), |role| {
                 gnome_shell_introspect::WindowProperties {
                     title: role.title.clone().unwrap_or_default(),
@@ -2331,6 +2337,7 @@ impl State {
                         // work well enough in practice.
                         .map(|app_id| format!("{app_id}.desktop"))
                         .unwrap_or_default(),
+                    time_since_user_time,
                 }
             });
 
